@@ -42,8 +42,9 @@ from slamware_ros_sdk.msg import (
     RobotBasicState,
     SetMapLocalizationRequest,
     SetMapUpdateRequest,
+    SyncMapRequest,
 )
-from slamware_ros_sdk.srv import SyncGetStcm
+from slamware_ros_sdk.srv import SyncGetStcm, SyncSetStcm
 from std_msgs.msg import String
 
 
@@ -792,8 +793,10 @@ class BaseSensorNode(Node):
         set_map_update_topic: str,
         clear_map_topic: str,
         sync_get_stcm_service: str,
+        sync_set_stcm_service: str,
         maps_dir: str,
         sync_get_stcm_timeout_sec: float,
+        sync_set_stcm_timeout_sec: float,
         cmd_vel_topic: str,
         global_plan_path_topic: str,
         robot_basic_state_topic: str,
@@ -836,10 +839,13 @@ class BaseSensorNode(Node):
         self.set_map_update_topic = str(set_map_update_topic)
         self.clear_map_topic = str(clear_map_topic)
         self.sync_get_stcm_service = str(sync_get_stcm_service)
+        self.sync_set_stcm_service = str(sync_set_stcm_service)
         self.maps_dir = FsPath(maps_dir)
         self.sync_get_stcm_timeout_sec = max(3.0, min(120.0, float(sync_get_stcm_timeout_sec)))
+        self.sync_set_stcm_timeout_sec = max(3.0, min(120.0, float(sync_set_stcm_timeout_sec)))
         self.last_mapping_command: Optional[Dict[str, Any]] = None
         self.last_map_save: Optional[Dict[str, Any]] = None
+        self.last_map_load: Optional[Dict[str, Any]] = None
         self.arm_command_topic = arm_command_topic
         self.arm_status_topic = arm_status_topic
         self.arm_task_timeout_sec = max(1.0, float(arm_task_timeout_sec))
@@ -890,7 +896,12 @@ class BaseSensorNode(Node):
         self.set_map_localization_pub = self.create_publisher(SetMapLocalizationRequest, set_map_localization_topic, qos)
         self.set_map_update_pub = self.create_publisher(SetMapUpdateRequest, set_map_update_topic, qos)
         self.clear_map_pub = self.create_publisher(ClearMapRequest, clear_map_topic, qos)
+        self.sync_map_topic = (
+            clear_map_topic.rsplit("/", 1)[0] + "/sync_map" if "/" in clear_map_topic else "sync_map"
+        )
+        self.sync_map_pub = self.create_publisher(SyncMapRequest, self.sync_map_topic, qos)
         self.sync_get_stcm_client = self.create_client(SyncGetStcm, sync_get_stcm_service)
+        self.sync_set_stcm_client = self.create_client(SyncSetStcm, sync_set_stcm_service)
         self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, qos)
         self.arm_task_command_pub = self.create_publisher(String, arm_command_topic, qos)
         self.get_logger().info(
@@ -1029,13 +1040,42 @@ class BaseSensorNode(Node):
         clear_value = payload.get("clear", True)
         clear = not (clear_value is False or str(clear_value).strip().lower() in ("false", "0", "no", "off"))
         if clear:
+            # A previously loaded map is "held" by localization mode, so a bare
+            # clear_map has no effect. Release it first (localization off + map
+            # update off), then clear, then re-enter SLAM (map update + localization on).
+            loc_off = SetMapLocalizationRequest()
+            loc_off.enabled = False
+            self.set_map_localization_pub.publish(loc_off)
+            time.sleep(0.3)
+
+            update_off = SetMapUpdateRequest()
+            update_off.enabled = False
+            update_off.kind = self._explorer_map_kind()
+            self.set_map_update_pub.publish(update_off)
+            time.sleep(0.3)
+
             clear_msg = ClearMapRequest()
             clear_msg.kind = self._explorer_map_kind()
             self.clear_map_pub.publish(clear_msg)
+            time.sleep(0.5)
+
+            # The ROS map worker updates incrementally, so it keeps publishing the
+            # cached grid after a clear. Force a full resync to reflect the wipe.
+            self.sync_map_pub.publish(SyncMapRequest())
+            time.sleep(0.5)
+
         update = SetMapUpdateRequest()
         update.enabled = True
         update.kind = self._explorer_map_kind()
         self.set_map_update_pub.publish(update)
+        time.sleep(0.2)
+
+        loc_on = SetMapLocalizationRequest()
+        loc_on.enabled = True
+        self.set_map_localization_pub.publish(loc_on)
+        time.sleep(0.2)
+        self.sync_map_pub.publish(SyncMapRequest())
+
         command = {
             "received_at": time.time(),
             "type": "start_mapping",
@@ -1044,6 +1084,7 @@ class BaseSensorNode(Node):
             "published_topics": {
                 "set_map_update": self.set_map_update_topic,
                 "clear_map": self.clear_map_topic if clear else None,
+                "set_map_localization": self.set_map_localization_topic if clear else None,
             },
         }
         self.last_mapping_command = command
@@ -1083,6 +1124,7 @@ class BaseSensorNode(Node):
             "map": map_info,
             "last_mapping_command": self.last_mapping_command,
             "last_map_save": self.last_map_save,
+            "last_map_load": self.last_map_load,
             "maps_dir": str(self.maps_dir),
             "saved_maps": self.list_saved_maps(),
         }
@@ -1184,6 +1226,100 @@ class BaseSensorNode(Node):
             "service": self.sync_get_stcm_service,
         }
         self.last_map_save = result
+        return result
+
+    def build_load_robot_pose(self, payload: Optional[Dict[str, Any]] = None) -> Pose:
+        payload = payload or {}
+        pose_payload = payload.get("robot_pose", payload.get("pose"))
+        if isinstance(pose_payload, dict):
+            x = finite_or_none(pose_payload.get("x"), 5) or 0.0
+            y = finite_or_none(pose_payload.get("y"), 5) or 0.0
+            z = finite_or_none(pose_payload.get("z"), 5) or 0.0
+            yaw = finite_or_none(pose_payload.get("yaw"))
+            if yaw is None:
+                yaw_deg = finite_or_none(pose_payload.get("yaw_deg"))
+                yaw = math.radians(float(yaw_deg)) if yaw_deg is not None else 0.0
+        else:
+            with self.state.lock:
+                odom = dict(self.state.odom) if self.state.odom else None
+            if odom and odom.get("x") is not None and odom.get("y") is not None:
+                x = float(odom["x"])
+                y = float(odom["y"])
+                z = float(odom.get("z") or 0.0)
+                yaw = float(odom.get("yaw") or 0.0)
+            else:
+                x = y = z = yaw = 0.0
+        pose_msg = Pose()
+        pose_msg.position.x = float(x)
+        pose_msg.position.y = float(y)
+        pose_msg.position.z = float(z)
+        q = quaternion_from_yaw(float(yaw))
+        pose_msg.orientation.x = q["x"]
+        pose_msg.orientation.y = q["y"]
+        pose_msg.orientation.z = q["z"]
+        pose_msg.orientation.w = q["w"]
+        return pose_msg
+
+    def call_sync_set_stcm(self, raw: bytes, robot_pose: Pose) -> Optional[str]:
+        if not self.sync_set_stcm_client.wait_for_service(timeout_sec=2.0):
+            return "sync_set_stcm service unavailable / 思岚地图加载服务不可用"
+        request = SyncSetStcm.Request()
+        request.raw_stcm = list(raw)
+        request.robot_pose = robot_pose
+        future = self.sync_set_stcm_client.call_async(request)
+        deadline = time.time() + self.sync_set_stcm_timeout_sec
+        while not future.done():
+            if time.time() > deadline:
+                return "sync_set_stcm timed out / 向底盘加载地图超时"
+            time.sleep(0.05)
+        try:
+            future.result()
+        except Exception as exc:
+            return f"sync_set_stcm failed / 加载地图失败: {exc}"
+        return None
+
+    def load_map(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        name = payload.get("name", payload.get("filename", payload.get("map_name")))
+        target, err = self.resolve_map_save_path(name)
+        if err:
+            return {"ok": False, "error": err}
+        assert target is not None
+        if not target.exists():
+            return {"ok": False, "error": f"map file not found / 地图文件不存在: {target.name}"}
+        try:
+            raw = target.read_bytes()
+        except OSError as exc:
+            return {"ok": False, "error": f"failed to read map file / 读取地图文件失败: {exc}"}
+        if not raw:
+            return {"ok": False, "error": "map file is empty / 地图文件为空"}
+        robot_pose = self.build_load_robot_pose(payload)
+        err = self.call_sync_set_stcm(raw, robot_pose)
+        if err:
+            return {"ok": False, "error": err}
+        result = {
+            "ok": True,
+            "name": target.name,
+            "path": str(target),
+            "size_bytes": len(raw),
+            "loaded_at": now_iso(),
+            "service": self.sync_set_stcm_service,
+            "robot_pose": {
+                "x": finite_or_none(robot_pose.position.x, 5),
+                "y": finite_or_none(robot_pose.position.y, 5),
+                "z": finite_or_none(robot_pose.position.z, 5),
+                "yaw": finite_or_none(
+                    yaw_from_quaternion(
+                        robot_pose.orientation.x,
+                        robot_pose.orientation.y,
+                        robot_pose.orientation.z,
+                        robot_pose.orientation.w,
+                    ),
+                    6,
+                ),
+            },
+        }
+        self.last_map_load = result
         return result
 
     def current_navigation_command(self, max_age_s: float = 300.0) -> Optional[Dict[str, Any]]:
@@ -3201,6 +3337,7 @@ HTML = r"""<!doctype html>
       <button id="startMappingBtn" class="primary" title="Clear the chassis map and start a fresh mapping session">Start Mapping</button>
       <button id="stopMappingBtn" title="Freeze the map and stop the mapping session">Stop Mapping</button>
       <button id="saveMappingBtn" title="Export the current chassis map to a .stcm file">Save Map</button>
+      <button id="loadMappingBtn" title="Load a saved .stcm map file into the chassis">Load Map</button>
       <span id="mappingStatus" class="map-build-status">Mapping: --</span>
     </div>
     <div id="mappingCanvasHost" class="mapping-canvas-host"></div>
@@ -4532,6 +4669,51 @@ HTML = r"""<!doctype html>
         );
       } catch (err) {
         alert('保存地图出错 / Save map error: ' + err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function loadMap() {
+      let hint = '输入要加载的地图名称 / Enter map name to load:';
+      let defaultName = '';
+      try {
+        const listRes = await fetch('/api/mapping/list', { cache: 'no-store' });
+        const listData = await listRes.json();
+        const maps = listData.saved_maps || [];
+        if (maps.length) {
+          defaultName = maps[maps.length - 1].name.replace(/\.stcm$/i, '');
+          hint = '已存档地图 / Saved maps:\n' +
+            maps.map(m => `- ${m.name} (${m.size_bytes} bytes)`).join('\n') +
+            '\n\n输入要加载的名称 / Enter map name to load:';
+        }
+      } catch (err) {
+        hint = '读取地图列表失败，仍可手动输入名称 / Failed to list maps, enter name manually:';
+      }
+      const name = prompt(hint, defaultName);
+      if (!name || !String(name).trim()) return;
+      if (!confirm(
+        '将把已存档地图加载到底盘，覆盖底盘当前地图。\n' +
+        'Load the archived map into the chassis and replace the current chassis map?'
+      )) return;
+      const btn = document.getElementById('loadMappingBtn');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/mapping/load', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: String(name).trim() }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert('加载地图失败 / Load map failed: ' + (data.error || 'unknown'));
+          return;
+        }
+        alert(`地图已加载 / Map loaded:\n${data.path}\n${data.size_bytes} bytes`);
+        cachedMapSeq = -1;
+        if (lastState) drawMap(lastState);
+      } catch (err) {
+        alert('加载地图出错 / Load map error: ' + err);
       } finally {
         btn.disabled = false;
       }
@@ -5918,6 +6100,7 @@ HTML = r"""<!doctype html>
     document.getElementById('startMappingBtn').addEventListener('click', startMapping);
     document.getElementById('stopMappingBtn').addEventListener('click', stopMapping);
     document.getElementById('saveMappingBtn').addEventListener('click', saveMap);
+    document.getElementById('loadMappingBtn').addEventListener('click', loadMap);
     document.getElementById('tabMapping').addEventListener('click', enterMappingMode);
     document.getElementById('tabDashboard').addEventListener('click', exitMappingMode);
     document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && mappingModeActive) exitMappingMode(); });
@@ -5994,6 +6177,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.write_json(self.node_ref.relocalization_status())
         elif parsed.path == "/api/mapping/status":
             self.write_json(self.node_ref.mapping_status())
+        elif parsed.path in ("/api/mapping/list", "/api/mapping/files"):
+            self.write_json({"ok": True, "maps_dir": str(self.node_ref.maps_dir), "saved_maps": self.node_ref.list_saved_maps()})
         elif parsed.path == "/api/health":
             snap = self.state.snapshot()
             self.write_json(
@@ -6070,6 +6255,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             self.write_json(self.node_ref.save_map(payload))
+        elif parsed.path in ("/api/mapping/load", "/api/mapping/load_map"):
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.load_map(payload))
         elif parsed.path in ("/api/mapping/list", "/api/mapping/files"):
             self.write_json({"ok": True, "maps_dir": str(self.node_ref.maps_dir), "saved_maps": self.node_ref.list_saved_maps()})
         elif parsed.path == "/api/fault_snapshots/log":
@@ -6175,8 +6365,10 @@ def main() -> int:
     parser.add_argument("--set-map-update-topic", default="/slamware_ros_sdk_server_node/set_map_update")
     parser.add_argument("--clear-map-topic", default="/slamware_ros_sdk_server_node/clear_map")
     parser.add_argument("--sync-get-stcm-service", default="/sync_get_stcm")
+    parser.add_argument("--sync-set-stcm-service", default="/sync_set_stcm")
     parser.add_argument("--maps-dir", default="data/map")
     parser.add_argument("--sync-get-stcm-timeout-sec", type=float, default=30.0)
+    parser.add_argument("--sync-set-stcm-timeout-sec", type=float, default=30.0)
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--global-plan-path-topic", default="/slamware_ros_sdk_server_node/global_plan_path")
     parser.add_argument("--robot-basic-state-topic", default="/slamware_ros_sdk_server_node/robot_basic_state")
@@ -6235,8 +6427,10 @@ def main() -> int:
         set_map_update_topic=args.set_map_update_topic,
         clear_map_topic=args.clear_map_topic,
         sync_get_stcm_service=args.sync_get_stcm_service,
+        sync_set_stcm_service=args.sync_set_stcm_service,
         maps_dir=args.maps_dir,
         sync_get_stcm_timeout_sec=args.sync_get_stcm_timeout_sec,
+        sync_set_stcm_timeout_sec=args.sync_set_stcm_timeout_sec,
         cmd_vel_topic=args.cmd_vel_topic,
         global_plan_path_topic=args.global_plan_path_topic,
         robot_basic_state_topic=args.robot_basic_state_topic,
