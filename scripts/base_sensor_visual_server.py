@@ -34,12 +34,16 @@ from sensor_msgs.msg import LaserScan, PointCloud2
 from slamware_ros_sdk.msg import (
     BasicSensorValueDataArray,
     CancelActionRequest,
+    ClearMapRequest,
     LocalizationMovement,
+    MapKind,
     MoveToLocationsRequest,
     RecoverLocalizationRequest,
     RobotBasicState,
     SetMapLocalizationRequest,
+    SetMapUpdateRequest,
 )
+from slamware_ros_sdk.srv import SyncGetStcm
 from std_msgs.msg import String
 
 
@@ -785,6 +789,11 @@ class BaseSensorNode(Node):
         set_pose_topic: str,
         recover_localization_topic: str,
         set_map_localization_topic: str,
+        set_map_update_topic: str,
+        clear_map_topic: str,
+        sync_get_stcm_service: str,
+        maps_dir: str,
+        sync_get_stcm_timeout_sec: float,
         cmd_vel_topic: str,
         global_plan_path_topic: str,
         robot_basic_state_topic: str,
@@ -824,6 +833,13 @@ class BaseSensorNode(Node):
         self.set_pose_topic = str(set_pose_topic)
         self.recover_localization_topic = str(recover_localization_topic)
         self.set_map_localization_topic = str(set_map_localization_topic)
+        self.set_map_update_topic = str(set_map_update_topic)
+        self.clear_map_topic = str(clear_map_topic)
+        self.sync_get_stcm_service = str(sync_get_stcm_service)
+        self.maps_dir = FsPath(maps_dir)
+        self.sync_get_stcm_timeout_sec = max(3.0, min(120.0, float(sync_get_stcm_timeout_sec)))
+        self.last_mapping_command: Optional[Dict[str, Any]] = None
+        self.last_map_save: Optional[Dict[str, Any]] = None
         self.arm_command_topic = arm_command_topic
         self.arm_status_topic = arm_status_topic
         self.arm_task_timeout_sec = max(1.0, float(arm_task_timeout_sec))
@@ -872,6 +888,9 @@ class BaseSensorNode(Node):
         self.set_pose_pub = self.create_publisher(Pose, set_pose_topic, qos)
         self.recover_localization_pub = self.create_publisher(RecoverLocalizationRequest, recover_localization_topic, qos)
         self.set_map_localization_pub = self.create_publisher(SetMapLocalizationRequest, set_map_localization_topic, qos)
+        self.set_map_update_pub = self.create_publisher(SetMapUpdateRequest, set_map_update_topic, qos)
+        self.clear_map_pub = self.create_publisher(ClearMapRequest, clear_map_topic, qos)
+        self.sync_get_stcm_client = self.create_client(SyncGetStcm, sync_get_stcm_service)
         self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, qos)
         self.arm_task_command_pub = self.create_publisher(String, arm_command_topic, qos)
         self.get_logger().info(
@@ -998,6 +1017,174 @@ class BaseSensorNode(Node):
             command["seq"] = self.state.seq["relocalization_command"]
             self.state.last_relocalization_command = command
         return {"ok": True, "relocalization_started": not dry_run, "dry_run": dry_run, "command": command}
+
+    @staticmethod
+    def _explorer_map_kind() -> MapKind:
+        kind = MapKind()
+        kind.kind = int(MapKind.EXPLORERMAP)
+        return kind
+
+    def start_mapping(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        clear_value = payload.get("clear", True)
+        clear = not (clear_value is False or str(clear_value).strip().lower() in ("false", "0", "no", "off"))
+        if clear:
+            clear_msg = ClearMapRequest()
+            clear_msg.kind = self._explorer_map_kind()
+            self.clear_map_pub.publish(clear_msg)
+        update = SetMapUpdateRequest()
+        update.enabled = True
+        update.kind = self._explorer_map_kind()
+        self.set_map_update_pub.publish(update)
+        command = {
+            "received_at": time.time(),
+            "type": "start_mapping",
+            "enabled": True,
+            "cleared": clear,
+            "published_topics": {
+                "set_map_update": self.set_map_update_topic,
+                "clear_map": self.clear_map_topic if clear else None,
+            },
+        }
+        self.last_mapping_command = command
+        return {"ok": True, "mapping": "started", "cleared": clear, "command": command}
+
+    def stop_mapping(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        _ = payload
+        update = SetMapUpdateRequest()
+        update.enabled = False
+        update.kind = self._explorer_map_kind()
+        self.set_map_update_pub.publish(update)
+        command = {
+            "received_at": time.time(),
+            "type": "stop_mapping",
+            "enabled": False,
+            "published_topics": {"set_map_update": self.set_map_update_topic},
+        }
+        self.last_mapping_command = command
+        return {"ok": True, "mapping": "stopped", "command": command}
+
+    def mapping_status(self) -> Dict[str, Any]:
+        with self.state.lock:
+            basic = dict(self.state.robot_basic_state) if self.state.robot_basic_state else None
+            map_payload = dict(self.state.map) if self.state.map else None
+        map_info = None
+        if map_payload:
+            map_info = {
+                "width": map_payload.get("width"),
+                "height": map_payload.get("height"),
+                "resolution": map_payload.get("resolution"),
+                "origin": map_payload.get("origin"),
+            }
+        return {
+            "ok": True,
+            "is_map_building_enabled": bool(basic.get("is_map_building_enabled")) if basic else None,
+            "is_localization_enabled": bool(basic.get("is_localization_enabled")) if basic else None,
+            "map": map_info,
+            "last_mapping_command": self.last_mapping_command,
+            "last_map_save": self.last_map_save,
+            "maps_dir": str(self.maps_dir),
+            "saved_maps": self.list_saved_maps(),
+        }
+
+    @staticmethod
+    def resolve_map_filename(name: Any) -> Tuple[Optional[str], Optional[str]]:
+        raw = str(name or "").strip()
+        if not raw:
+            return None, "map name is required / 地图名称不能为空"
+        if not raw.lower().endswith(".stcm"):
+            raw = raw + ".stcm"
+        filename = FsPath(raw).name
+        if not filename or filename in (".stcm",) or ".." in filename:
+            return None, "invalid map name / 地图名称无效"
+        if "/" in filename or "\\" in filename:
+            return None, "invalid map name / 地图名称无效"
+        return filename, None
+
+    def resolve_map_save_path(self, name: Any) -> Tuple[Optional[FsPath], Optional[str]]:
+        filename, err = self.resolve_map_filename(name)
+        if err:
+            return None, err
+        base = self.maps_dir.resolve()
+        base.mkdir(parents=True, exist_ok=True)
+        target = (base / filename).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            return None, "invalid map path / 地图保存路径无效"
+        return target, None
+
+    def list_saved_maps(self) -> List[Dict[str, Any]]:
+        base = self.maps_dir
+        if not base.exists():
+            return []
+        items: List[Dict[str, Any]] = []
+        for path in sorted(base.glob("*.stcm")):
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            items.append(
+                {
+                    "name": path.name,
+                    "path": str(path),
+                    "size_bytes": int(stat.st_size),
+                    "modified_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime)),
+                }
+            )
+        return items
+
+    def call_sync_get_stcm(self) -> Tuple[Optional[bytes], Optional[str]]:
+        if not self.sync_get_stcm_client.wait_for_service(timeout_sec=2.0):
+            return None, "sync_get_stcm service unavailable / 思岚地图导出服务不可用"
+        request = SyncGetStcm.Request()
+        future = self.sync_get_stcm_client.call_async(request)
+        deadline = time.time() + self.sync_get_stcm_timeout_sec
+        while not future.done():
+            if time.time() > deadline:
+                return None, "sync_get_stcm timed out / 从底盘导出地图超时"
+            time.sleep(0.05)
+        try:
+            response = future.result()
+        except Exception as exc:
+            return None, f"sync_get_stcm failed / 导出地图失败: {exc}"
+        if response is None:
+            return None, "sync_get_stcm returned no response / 导出地图无响应"
+        raw = bytes(response.raw_stcm)
+        if not raw:
+            return None, "empty map data from chassis / 底盘返回的地图数据为空"
+        return raw, None
+
+    def save_map(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        name = payload.get("name", payload.get("filename", payload.get("map_name")))
+        target, err = self.resolve_map_save_path(name)
+        if err:
+            return {"ok": False, "error": err}
+        raw, err = self.call_sync_get_stcm()
+        if err:
+            return {"ok": False, "error": err}
+        assert target is not None
+        tmp_path = target.with_suffix(target.suffix + ".tmp")
+        try:
+            tmp_path.write_bytes(raw)
+            os.replace(tmp_path, target)
+        except OSError as exc:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+            return {"ok": False, "error": f"failed to write map file / 写入地图文件失败: {exc}"}
+        result = {
+            "ok": True,
+            "name": target.name,
+            "path": str(target),
+            "size_bytes": len(raw),
+            "saved_at": now_iso(),
+            "service": self.sync_get_stcm_service,
+        }
+        self.last_map_save = result
+        return result
 
     def current_navigation_command(self, max_age_s: float = 300.0) -> Optional[Dict[str, Any]]:
         now = time.time()
@@ -2339,6 +2526,9 @@ HTML = r"""<!doctype html>
       background: var(--bg);
       color: var(--text);
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
     }
     header {
       display: flex;
@@ -2362,6 +2552,43 @@ HTML = r"""<!doctype html>
     }
     .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--warn); }
     .dot.ok { background: var(--ok); }
+    .map-build-status { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .header-tabs { display: flex; align-items: baseline; gap: 16px; min-width: 0; }
+    .view-tab {
+      padding: 0;
+      border: none;
+      background: none;
+      font-family: inherit;
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 15px;
+      font-weight: 600;
+      line-height: 1.2;
+      transition: font-size .12s ease, color .12s ease;
+    }
+    .view-tab:not(.active):hover { color: var(--text); text-decoration: underline; }
+    .view-tab.active { background: none; border: none; color: var(--text); font-size: 20px; font-weight: 700; cursor: default; }
+    main.view-hidden { display: none; }
+    #mappingView { display: none; flex: 1; min-height: 0; flex-direction: column; padding: 14px; }
+    #mappingView.view-active { display: flex; }
+    .mapping-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-bottom: 12px; }
+    .mapping-toolbar button {
+      padding: 7px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      cursor: pointer;
+    }
+    .mapping-toolbar button.primary { background: var(--text); color: #fff; border-color: var(--text); font-weight: 600; }
+    .mapping-toolbar button.primary:hover { filter: brightness(1.25); }
+    .mapping-toolbar button:not(.primary):hover { background: #eef1f6; }
+    .mapping-toolbar button:disabled { opacity: .5; cursor: not-allowed; }
+    body.mapping-active { height: 100vh; overflow: hidden; }
+    .mapping-canvas-host { flex: 1; min-height: 0; display: flex; }
+    .mapping-canvas-host .canvas-wrap { flex: 1; width: 100%; height: 100%; min-height: 0; margin: 0; padding: 0; }
+    .mapping-canvas-host .canvas-wrap canvas,
+    .mapping-canvas-host #mapCanvas { width: 100%; height: 100%; aspect-ratio: auto; }
     main {
       display: grid;
       grid-template-columns: minmax(360px, 1.2fr) minmax(340px, 1fr);
@@ -2962,9 +3189,22 @@ HTML = r"""<!doctype html>
 </head>
 <body>
   <header>
-    <h1>Base Sensor Dashboard</h1>
+    <div class="header-tabs">
+      <button id="tabDashboard" class="view-tab active">Base Sensor Dashboard</button>
+      <button id="tabMapping" class="view-tab">Mapping Mode</button>
+    </div>
     <div class="status"><span id="statusDot" class="dot"></span><span id="statusText">connecting</span></div>
   </header>
+
+  <div id="mappingView">
+    <div class="mapping-toolbar">
+      <button id="startMappingBtn" class="primary" title="Clear the chassis map and start a fresh mapping session">Start Mapping</button>
+      <button id="stopMappingBtn" title="Freeze the map and stop the mapping session">Stop Mapping</button>
+      <button id="saveMappingBtn" title="Export the current chassis map to a .stcm file">Save Map</button>
+      <span id="mappingStatus" class="map-build-status">Mapping: --</span>
+    </div>
+    <div id="mappingCanvasHost" class="mapping-canvas-host"></div>
+  </div>
   <main>
     <section class="map-section">
       <div class="panel-head">
@@ -4176,6 +4416,127 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function updateMappingStatus(state) {
+      const el = document.getElementById('mappingStatus');
+      if (!el) return;
+      const basic = state && state.navigation ? state.navigation.robot_basic_state : null;
+      const building = basic ? basic.is_map_building_enabled : null;
+      if (building === null || building === undefined) {
+        el.textContent = 'Mapping: --';
+        el.style.color = 'var(--muted)';
+        return;
+      }
+      el.textContent = building ? 'Mapping: ON' : 'Mapping: OFF';
+      el.style.color = building ? 'var(--ok)' : 'var(--muted)';
+    }
+
+    let mappingModeActive = false;
+    let mapWrapPlaceholder = null;
+
+    function enterMappingMode() {
+      if (mappingModeActive) return;
+      const wrap = mapCanvas.parentElement;
+      const host = document.getElementById('mappingCanvasHost');
+      const view = document.getElementById('mappingView');
+      const mainEl = document.querySelector('main');
+      if (!wrap || !host || !view || !mainEl) return;
+      if (!mapWrapPlaceholder) mapWrapPlaceholder = document.createComment('map-wrap-home');
+      if (wrap.parentNode) wrap.parentNode.insertBefore(mapWrapPlaceholder, wrap);
+      host.appendChild(wrap);
+      document.body.classList.add('mapping-active');
+      mainEl.classList.add('view-hidden');
+      view.classList.add('view-active');
+      document.getElementById('tabMapping').classList.add('active');
+      document.getElementById('tabDashboard').classList.remove('active');
+      mappingModeActive = true;
+      cachedMapSeq = -1;
+      try { if (lastState) drawMap(lastState); } catch (e) {}
+    }
+
+    function exitMappingMode() {
+      const view = document.getElementById('mappingView');
+      const mainEl = document.querySelector('main');
+      if (view) view.classList.remove('view-active');
+      if (mainEl) mainEl.classList.remove('view-hidden');
+      document.body.classList.remove('mapping-active');
+      const wrap = mapCanvas.parentElement;
+      if (wrap && mapWrapPlaceholder && mapWrapPlaceholder.parentNode) {
+        mapWrapPlaceholder.parentNode.insertBefore(wrap, mapWrapPlaceholder);
+        mapWrapPlaceholder.parentNode.removeChild(mapWrapPlaceholder);
+      }
+      document.getElementById('tabDashboard').classList.add('active');
+      document.getElementById('tabMapping').classList.remove('active');
+      mappingModeActive = false;
+      cachedMapSeq = -1;
+      try { if (lastState) drawMap(lastState); } catch (e) {}
+    }
+
+    async function startMapping() {
+      if (!confirm('开始重新建图？此操作会清空底盘上当前的地图。\n（备注：开始采集只清空底盘当前地图，已存档的地图文件不会被清空。）\nStart a fresh map? This will CLEAR the current map on the chassis.\n(Note: starting a new session only clears the chassis map; archived map files are kept.)')) return;
+      const btn = document.getElementById('startMappingBtn');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/mapping/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ clear: true }),
+        });
+        const data = await res.json();
+        if (!data.ok) alert('开始采集失败 / Start mapping failed: ' + (data.error || 'unknown'));
+      } catch (err) {
+        alert('开始采集出错 / Start mapping error: ' + err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function stopMapping() {
+      const btn = document.getElementById('stopMappingBtn');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/mapping/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        if (!data.ok) alert('结束采集失败 / Stop mapping failed: ' + (data.error || 'unknown'));
+      } catch (err) {
+        alert('结束采集出错 / Stop mapping error: ' + err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function saveMap() {
+      const name = prompt(
+        '输入地图名称（例如 八维通 或 八维通.stcm）\nEnter map name (e.g. Baweitong or Baweitong.stcm):',
+        ''
+      );
+      if (!name || !String(name).trim()) return;
+      const btn = document.getElementById('saveMappingBtn');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/mapping/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: String(name).trim() }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert('保存地图失败 / Save map failed: ' + (data.error || 'unknown'));
+          return;
+        }
+        alert(
+          `地图已保存 / Map saved:\n${data.path}\n${data.size_bytes} bytes`
+        );
+      } catch (err) {
+        alert('保存地图出错 / Save map error: ' + err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
     async function tick() {
       try {
         const res = await fetch('/api/state', { cache: 'no-store' });
@@ -4190,6 +4551,7 @@ HTML = r"""<!doctype html>
         updateReadouts(state);
         updateNavigationStatus(state);
         updateWorkflowProgress(state);
+        updateMappingStatus(state);
         document.getElementById('rawState').textContent = JSON.stringify({
           freshness_s: state.freshness_s,
           seq: state.seq,
@@ -5553,6 +5915,12 @@ HTML = r"""<!doctype html>
     });
     document.getElementById('saveRelocalizationAnchorBtn').addEventListener('click', saveRelocalizationAnchor);
     document.getElementById('runRelocalizationBtn').addEventListener('click', runRelocalization);
+    document.getElementById('startMappingBtn').addEventListener('click', startMapping);
+    document.getElementById('stopMappingBtn').addEventListener('click', stopMapping);
+    document.getElementById('saveMappingBtn').addEventListener('click', saveMap);
+    document.getElementById('tabMapping').addEventListener('click', enterMappingMode);
+    document.getElementById('tabDashboard').addEventListener('click', exitMappingMode);
+    document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && mappingModeActive) exitMappingMode(); });
     document.getElementById('startNavigationBtn').addEventListener('click', startNavigation);
     document.getElementById('runWorkflowBtn').addEventListener('click', runWorkflow);
     document.getElementById('stopNavigationBtn').addEventListener('click', stopNavigation);
@@ -5624,6 +5992,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.write_json(self.node_ref.fault_logger.list_payload())
         elif parsed.path in ("/api/relocalization/status", "/api/relocalization"):
             self.write_json(self.node_ref.relocalization_status())
+        elif parsed.path == "/api/mapping/status":
+            self.write_json(self.node_ref.mapping_status())
         elif parsed.path == "/api/health":
             snap = self.state.snapshot()
             self.write_json(
@@ -5685,6 +6055,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             self.write_json(self.node_ref.run_relocalization(payload))
+        elif parsed.path in ("/api/mapping/start", "/api/mapping/start_collection"):
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.start_mapping(payload))
+        elif parsed.path in ("/api/mapping/stop", "/api/mapping/stop_collection"):
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.stop_mapping(payload))
+        elif parsed.path in ("/api/mapping/save", "/api/mapping/save_map"):
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.save_map(payload))
+        elif parsed.path in ("/api/mapping/list", "/api/mapping/files"):
+            self.write_json({"ok": True, "maps_dir": str(self.node_ref.maps_dir), "saved_maps": self.node_ref.list_saved_maps()})
         elif parsed.path == "/api/fault_snapshots/log":
             payload = self.read_json_body()
             if payload is None:
@@ -5785,6 +6172,11 @@ def main() -> int:
     parser.add_argument("--set-pose-topic", default="/slamware_ros_sdk_server_node/set_pose")
     parser.add_argument("--recover-localization-topic", default="/slamware_ros_sdk_server_node/recover_localization")
     parser.add_argument("--set-map-localization-topic", default="/slamware_ros_sdk_server_node/set_map_localization")
+    parser.add_argument("--set-map-update-topic", default="/slamware_ros_sdk_server_node/set_map_update")
+    parser.add_argument("--clear-map-topic", default="/slamware_ros_sdk_server_node/clear_map")
+    parser.add_argument("--sync-get-stcm-service", default="/sync_get_stcm")
+    parser.add_argument("--maps-dir", default="data/map")
+    parser.add_argument("--sync-get-stcm-timeout-sec", type=float, default=30.0)
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--global-plan-path-topic", default="/slamware_ros_sdk_server_node/global_plan_path")
     parser.add_argument("--robot-basic-state-topic", default="/slamware_ros_sdk_server_node/robot_basic_state")
@@ -5840,6 +6232,11 @@ def main() -> int:
         set_pose_topic=args.set_pose_topic,
         recover_localization_topic=args.recover_localization_topic,
         set_map_localization_topic=args.set_map_localization_topic,
+        set_map_update_topic=args.set_map_update_topic,
+        clear_map_topic=args.clear_map_topic,
+        sync_get_stcm_service=args.sync_get_stcm_service,
+        maps_dir=args.maps_dir,
+        sync_get_stcm_timeout_sec=args.sync_get_stcm_timeout_sec,
         cmd_vel_topic=args.cmd_vel_topic,
         global_plan_path_topic=args.global_plan_path_topic,
         robot_basic_state_topic=args.robot_basic_state_topic,
