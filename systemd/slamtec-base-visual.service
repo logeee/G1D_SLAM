@@ -1,0 +1,17 @@
+[Unit]
+Description=SLAMTEC Base Sensor Visualization Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/home/unitree/SLAMTEC_BASE_VISUALIZATION
+ExecStart=/bin/bash scripts/base_sensor_visual_server.sh
+Restart=always
+RestartSec=3
+StandardOutput=append:/tmp/base_sensor_visual_server_18083.log
+StandardError=append:/tmp/base_sensor_visual_server_18083.log
+
+[Install]
+WantedBy=multi-user.target

@@ -14,7 +14,7 @@
 在机器人上进入仓库：
 
 ```bash
-cd ~/unifolm-world-model-action/robot_client_unitree_g1_full_20260509/repos/unitree_deploy
+cd ~/SLAMTEC_BASE_VISUALIZATION
 nohup bash scripts/base_sensor_visual_server.sh > /tmp/base_sensor_visual_server_18083.log 2>&1 &
 ```
 
@@ -22,6 +22,29 @@ nohup bash scripts/base_sensor_visual_server.sh > /tmp/base_sensor_visual_server
 
 ```bash
 curl -s http://127.0.0.1:18083/api/health
+```
+
+## 开机启动
+
+安装 systemd 服务：
+
+```bash
+cd ~/SLAMTEC_BASE_VISUALIZATION
+sudo cp systemd/slamtec-base-visual.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now slamtec-base-visual.service
+```
+
+查看状态：
+
+```bash
+systemctl status slamtec-base-visual.service --no-pager
+```
+
+查看日志：
+
+```bash
+journalctl -u slamtec-base-visual.service -f
 ```
 
 ## 本地浏览器查看

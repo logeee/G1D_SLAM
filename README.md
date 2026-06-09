@@ -17,7 +17,7 @@
 在机器人上进入部署目录：
 
 ```bash
-cd ~/unifolm-world-model-action/robot_client_unitree_g1_full_20260509/repos/unitree_deploy
+cd ~/SLAMTEC_BASE_VISUALIZATION
 nohup bash scripts/base_sensor_visual_server.sh > /tmp/base_sensor_visual_server_18083.log 2>&1 &
 ```
 
@@ -31,6 +31,29 @@ curl -s http://127.0.0.1:18083/api/health
 
 ```text
 http://192.168.0.149:18083/
+```
+
+## 开机启动
+
+安装 systemd 服务：
+
+```bash
+cd ~/SLAMTEC_BASE_VISUALIZATION
+sudo cp systemd/slamtec-base-visual.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now slamtec-base-visual.service
+```
+
+查看状态：
+
+```bash
+systemctl status slamtec-base-visual.service --no-pager
+```
+
+查看日志：
+
+```bash
+journalctl -u slamtec-base-visual.service -f
 ```
 
 ## 依赖
@@ -49,6 +72,7 @@ source /unitree/module/slamware_service_pc4/install/setup.bash
 ```text
 scripts/base_sensor_visual_server.py   Web + ROS2 可视化服务
 scripts/base_sensor_visual_server.sh   机器人启动脚本
+systemd/slamtec-base-visual.service    开机启动服务
 docs/base_sensor_visualization.md      中文使用说明
 ```
 
