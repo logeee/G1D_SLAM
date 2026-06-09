@@ -17,7 +17,7 @@
 在机器人上进入部署目录：
 
 ```bash
-cd ~/SLAMTEC_BASE_VISUALIZATION
+cd ~/G1D_SLAM
 nohup bash scripts/base_sensor_visual_server.sh > /tmp/base_sensor_visual_server_18083.log 2>&1 &
 ```
 
@@ -38,7 +38,7 @@ http://192.168.0.149:18083/
 安装 systemd 服务：
 
 ```bash
-cd ~/SLAMTEC_BASE_VISUALIZATION
+cd ~/G1D_SLAM
 sudo cp systemd/slamtec-base-visual.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now slamtec-base-visual.service
