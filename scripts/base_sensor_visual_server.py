@@ -707,7 +707,7 @@ HTML = r"""<!doctype html>
           const a = scan.angle_min + i * scan.angle_increment;
           const x = r * Math.cos(a);
           const y = r * Math.sin(a);
-          const px = cx + y * scale;
+          const px = cx - y * scale;
           const py = cy - x * scale;
           ctx.fillRect(px - 1.5, py - 1.5, 3, 3);
         }
