@@ -43,6 +43,7 @@ http://192.168.0.149:18083/
 - 橙色线：Slamware 底层返回的 `global_plan_path`，也就是真实规划路径。
 - `设置朝向`：先选好航点，再点击该按钮，然后在地图上点一下终点需要面向的方向。
 - `清除朝向`：删除手动朝向，恢复为自动朝向。
+- `角度°` + `应用角度`：直接输入终点目标角度，单位是度；例如 `90` 表示 90 度。
 - `开始导航`：把当前航点发布到 `/slamware_ros_sdk_server_node/move_to_locations`。
 - `停止导航`：发布 `/slamware_ros_sdk_server_node/cancel_action`。
 

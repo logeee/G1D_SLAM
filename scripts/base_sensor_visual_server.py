@@ -887,6 +887,13 @@ HTML = r"""<!doctype html>
       font-size: 12px;
       margin-left: auto;
     }
+    .heading-input {
+      width: 96px;
+      border: 1px solid #b9c6d8;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+    }
     .nav-status {
       padding: 0 10px 10px;
       color: var(--muted);
@@ -936,6 +943,8 @@ HTML = r"""<!doctype html>
         <button id="clearWaypointsBtn">清空点</button>
         <button id="setHeadingBtn">设置朝向</button>
         <button id="clearHeadingBtn">清除朝向</button>
+        <input id="headingDegInput" class="heading-input" type="number" step="1" min="-180" max="180" placeholder="角度°" />
+        <button id="applyHeadingDegBtn">应用角度</button>
         <button id="startNavigationBtn" class="primary">开始导航</button>
         <button id="stopNavigationBtn" class="danger">停止导航</button>
         <span id="navHint" class="nav-hint">在地图上点击添加航点</span>
@@ -1010,6 +1019,7 @@ HTML = r"""<!doctype html>
     let selectedWaypoints = [];
     let headingMode = false;
     let finalHeadingPoint = null;
+    let manualHeadingDeg = null;
     let cloudYaw = -0.75;
     let cloudPitch = 0.65;
     let cloudDragging = false;
@@ -1094,6 +1104,10 @@ HTML = r"""<!doctype html>
     function computeTargetYaw(state = lastState) {
       if (!selectedWaypoints.length) return null;
       const lastPoint = selectedWaypoints[selectedWaypoints.length - 1];
+      if (manualHeadingDeg !== null && manualHeadingDeg !== undefined) {
+        const yaw = normalizeAngle(Number(manualHeadingDeg) * Math.PI / 180);
+        return { yaw, yawDeg: radToDeg(yaw), source: 'manual_heading_input_deg', label: '输入' };
+      }
       if (finalHeadingPoint) {
         const dx = finalHeadingPoint.x - lastPoint.x;
         const dy = finalHeadingPoint.y - lastPoint.y;
@@ -1153,7 +1167,7 @@ HTML = r"""<!doctype html>
       const lastPoint = selectedWaypoints[selectedWaypoints.length - 1];
       const start = mapToCanvas(map, lastPoint.x, lastPoint.y, geom);
       let end;
-      if (finalHeadingPoint) {
+      if (finalHeadingPoint && manualHeadingDeg === null) {
         end = mapToCanvas(map, finalHeadingPoint.x, finalHeadingPoint.y, geom);
       } else {
         const dpr = window.devicePixelRatio || 1;
@@ -1504,6 +1518,8 @@ HTML = r"""<!doctype html>
       document.getElementById('clearWaypointsBtn').disabled = busy;
       document.getElementById('setHeadingBtn').disabled = busy;
       document.getElementById('clearHeadingBtn').disabled = busy;
+      document.getElementById('headingDegInput').disabled = busy;
+      document.getElementById('applyHeadingDegBtn').disabled = busy;
     }
 
     function showNavMessage(kind, text) {
@@ -1541,6 +1557,26 @@ HTML = r"""<!doctype html>
         updateReadouts(lastState);
         updateNavigationStatus(lastState);
       }
+    }
+
+    function applyHeadingDegFromInput() {
+      if (!selectedWaypoints.length) {
+        showNavMessage('bad', '导航：<strong>请先添加至少一个航点，再输入角度</strong>');
+        return;
+      }
+      const input = document.getElementById('headingDegInput');
+      const raw = Number(input.value);
+      if (!Number.isFinite(raw)) {
+        showNavMessage('bad', '导航：<strong>请输入有效角度</strong>');
+        return;
+      }
+      const yaw = normalizeAngle(raw * Math.PI / 180);
+      manualHeadingDeg = Number(radToDeg(yaw).toFixed(3));
+      input.value = manualHeadingDeg.toFixed(1);
+      finalHeadingPoint = null;
+      setHeadingMode(false);
+      refreshMapUi();
+      showNavMessage('', `导航：已输入终点朝向 <strong>${manualHeadingDeg.toFixed(1)}°</strong>`);
     }
 
     function buildNavigationPayload() {
@@ -1613,6 +1649,8 @@ HTML = r"""<!doctype html>
           return;
         }
         finalHeadingPoint = { x: Number(p.x.toFixed(4)), y: Number(p.y.toFixed(4)) };
+        manualHeadingDeg = null;
+        document.getElementById('headingDegInput').value = '';
         setHeadingMode(false);
         refreshMapUi();
         const targetYaw = computeTargetYaw(lastState);
@@ -1621,18 +1659,24 @@ HTML = r"""<!doctype html>
       }
       selectedWaypoints.push({ x: Number(p.x.toFixed(4)), y: Number(p.y.toFixed(4)) });
       finalHeadingPoint = null;
+      manualHeadingDeg = null;
+      document.getElementById('headingDegInput').value = '';
       refreshMapUi();
     });
 
     document.getElementById('undoWaypointBtn').addEventListener('click', () => {
       selectedWaypoints.pop();
       finalHeadingPoint = null;
+      manualHeadingDeg = null;
+      document.getElementById('headingDegInput').value = '';
       if (!selectedWaypoints.length) setHeadingMode(false);
       refreshMapUi();
     });
     document.getElementById('clearWaypointsBtn').addEventListener('click', () => {
       selectedWaypoints = [];
       finalHeadingPoint = null;
+      manualHeadingDeg = null;
+      document.getElementById('headingDegInput').value = '';
       setHeadingMode(false);
       refreshMapUi();
     });
@@ -1645,8 +1689,14 @@ HTML = r"""<!doctype html>
     });
     document.getElementById('clearHeadingBtn').addEventListener('click', () => {
       finalHeadingPoint = null;
+      manualHeadingDeg = null;
+      document.getElementById('headingDegInput').value = '';
       setHeadingMode(false);
       refreshMapUi();
+    });
+    document.getElementById('applyHeadingDegBtn').addEventListener('click', applyHeadingDegFromInput);
+    document.getElementById('headingDegInput').addEventListener('keydown', ev => {
+      if (ev.key === 'Enter') applyHeadingDegFromInput();
     });
     document.getElementById('startNavigationBtn').addEventListener('click', startNavigation);
     document.getElementById('stopNavigationBtn').addEventListener('click', stopNavigation);
