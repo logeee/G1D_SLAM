@@ -39,9 +39,14 @@ http://192.168.0.149:18083/
 打开页面后，在 `SLAM Map + Odometry` 地图上点击添加航点：
 
 - 紫色点/虚线：网页里手动选择的航点和直连预览。
+- 绿色箭头：终点目标朝向，也就是发给 Slamware 的 `yaw`。
 - 橙色线：Slamware 底层返回的 `global_plan_path`，也就是真实规划路径。
+- `设置朝向`：先选好航点，再点击该按钮，然后在地图上点一下终点需要面向的方向。
+- `清除朝向`：删除手动朝向，恢复为自动朝向。
 - `开始导航`：把当前航点发布到 `/slamware_ros_sdk_server_node/move_to_locations`。
 - `停止导航`：发布 `/slamware_ros_sdk_server_node/cancel_action`。
+
+如果没有手动设置朝向，页面会自动用最后一段路径方向计算终点 `yaw`。如果只有一个航点且没有手动朝向，后端会使用当前里程计 yaw。
 
 开始导航前会做基础安全检查：地图、里程计、激光、超声/碰撞传感器需要新鲜；航点不能落在地图外或占用栅格上；碰撞/超声触发时不允许启动。当前 `localization_quality=0` 会显示警告，但默认不拦截，可用 `--min-localization-quality` 改成强制拦截。
 
@@ -103,7 +108,15 @@ docs/base_sensor_visualization.md      中文使用说明
 ```bash
 curl -s -X POST http://127.0.0.1:18083/api/navigation/start \
   -H 'Content-Type: application/json' \
-  -d '{"waypoints":[{"x":1.0,"y":2.0},{"x":1.5,"y":2.5}]}'
+  -d '{"waypoints":[{"x":1.0,"y":2.0},{"x":1.5,"y":2.5}],"yaw_deg":90}'
+```
+
+`yaw` 也可以用弧度传：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/navigation/start \
+  -H 'Content-Type: application/json' \
+  -d '{"waypoints":[{"x":1.0,"y":2.0}],"yaw":1.5708,"yaw_source":"manual"}'
 ```
 
 停止导航：

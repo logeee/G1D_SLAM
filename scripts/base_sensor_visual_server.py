@@ -69,6 +69,10 @@ def yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def normalize_angle_rad(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
 def make_reliable_qos(depth: int = 10) -> QoSProfile:
     return QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
@@ -386,13 +390,10 @@ class BaseSensorNode(Node):
 
         request = MoveToLocationsRequest()
         request.locations = [Point(x=p["x"], y=p["y"], z=0.0) for p in waypoints]
-        yaw = payload.get("yaw")
-        if yaw is None:
-            yaw = self.infer_final_yaw(waypoints)
-        try:
-            request.yaw = float(yaw)
-        except (TypeError, ValueError):
-            request.yaw = 0.0
+        yaw_result = self.resolve_navigation_yaw(payload, waypoints)
+        if not yaw_result["ok"]:
+            return yaw_result
+        request.yaw = float(yaw_result["yaw"])
 
         speed_ratio = payload.get("speed_ratio")
         if speed_ratio is not None:
@@ -411,6 +412,7 @@ class BaseSensorNode(Node):
             "waypoints": waypoints,
             "yaw": finite_or_none(request.yaw, 5),
             "yaw_deg": finite_or_none(math.degrees(float(request.yaw)), 2),
+            "yaw_source": yaw_result["source"],
             "speed_ratio": finite_or_none(request.options.speed_ratio.value, 3)
             if request.options.speed_ratio.is_valid
             else None,
@@ -463,16 +465,35 @@ class BaseSensorNode(Node):
             points.append({"x": round(x, 4), "y": round(y, 4)})
         return points, errors
 
-    def infer_final_yaw(self, waypoints: List[Dict[str, float]]) -> float:
+    def resolve_navigation_yaw(self, payload: Dict[str, Any], waypoints: List[Dict[str, float]]) -> Dict[str, Any]:
+        yaw_source = str(payload.get("yaw_source") or "").strip() or None
+        if payload.get("yaw") is not None:
+            try:
+                yaw = normalize_angle_rad(float(payload.get("yaw")))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid yaw"}
+            return {"ok": True, "yaw": yaw, "source": yaw_source or "request_yaw_rad"}
+
+        if payload.get("yaw_deg") is not None:
+            try:
+                yaw = normalize_angle_rad(math.radians(float(payload.get("yaw_deg"))))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid yaw_deg"}
+            return {"ok": True, "yaw": yaw, "source": yaw_source or "request_yaw_deg"}
+
+        yaw, source = self.infer_final_yaw(waypoints)
+        return {"ok": True, "yaw": yaw, "source": yaw_source or source}
+
+    def infer_final_yaw(self, waypoints: List[Dict[str, float]]) -> Tuple[float, str]:
         if len(waypoints) >= 2:
             a = waypoints[-2]
             b = waypoints[-1]
-            return math.atan2(b["y"] - a["y"], b["x"] - a["x"])
+            return normalize_angle_rad(math.atan2(b["y"] - a["y"], b["x"] - a["x"])), "server_auto_last_segment"
         with self.state.lock:
             odom = self.state.odom
         if odom and odom.get("yaw") is not None:
-            return float(odom["yaw"])
-        return 0.0
+            return normalize_angle_rad(float(odom["yaw"])), "server_current_odom"
+        return 0.0, "server_default_zero"
 
     def check_navigation_safety(self, waypoints: List[Dict[str, float]]) -> Dict[str, Any]:
         now = time.time()
@@ -844,6 +865,11 @@ HTML = r"""<!doctype html>
       border-color: #fecaca;
       color: #b91c1c;
     }
+    button.active {
+      background: #16a34a;
+      border-color: #15803d;
+      color: #fff;
+    }
     button:disabled {
       cursor: not-allowed;
       opacity: 0.55;
@@ -900,9 +926,11 @@ HTML = r"""<!doctype html>
       <div class="toolbar">
         <button id="undoWaypointBtn">撤销点</button>
         <button id="clearWaypointsBtn">清空点</button>
+        <button id="setHeadingBtn">设置朝向</button>
+        <button id="clearHeadingBtn">清除朝向</button>
         <button id="startNavigationBtn" class="primary">开始导航</button>
         <button id="stopNavigationBtn" class="danger">停止导航</button>
-        <span class="nav-hint">在地图上点击添加航点</span>
+        <span id="navHint" class="nav-hint">在地图上点击添加航点</span>
       </div>
       <div id="navStatus" class="nav-status">导航：等待选点</div>
       <div class="readout">
@@ -914,6 +942,7 @@ HTML = r"""<!doctype html>
         <div class="metric"><div class="label">规划路径</div><div id="planCount" class="value">--</div></div>
         <div class="metric"><div class="label">定位</div><div id="localizationState" class="value">--</div></div>
         <div class="metric"><div class="label">导航指令</div><div id="navCommand" class="value">--</div></div>
+        <div class="metric"><div class="label">目标角度</div><div id="targetYaw" class="value">--</div></div>
       </div>
     </section>
 
@@ -971,6 +1000,8 @@ HTML = r"""<!doctype html>
     let lastState = null;
     let currentMapGeom = null;
     let selectedWaypoints = [];
+    let headingMode = false;
+    let finalHeadingPoint = null;
     let cloudYaw = -0.75;
     let cloudPitch = 0.65;
     let cloudDragging = false;
@@ -991,6 +1022,14 @@ HTML = r"""<!doctype html>
     function fmt(value, digits = 2, suffix = '') {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return '--';
       return `${Number(value).toFixed(digits)}${suffix}`;
+    }
+
+    function normalizeAngle(angle) {
+      return Math.atan2(Math.sin(angle), Math.cos(angle));
+    }
+
+    function radToDeg(angle) {
+      return normalizeAngle(angle) * 180 / Math.PI;
     }
 
     function setStatus(ok, text) {
@@ -1042,6 +1081,81 @@ HTML = r"""<!doctype html>
       });
       ctx.stroke();
       ctx.restore();
+    }
+
+    function computeTargetYaw(state = lastState) {
+      if (!selectedWaypoints.length) return null;
+      const lastPoint = selectedWaypoints[selectedWaypoints.length - 1];
+      if (finalHeadingPoint) {
+        const dx = finalHeadingPoint.x - lastPoint.x;
+        const dy = finalHeadingPoint.y - lastPoint.y;
+        if (Math.hypot(dx, dy) > 0.001) {
+          const yaw = normalizeAngle(Math.atan2(dy, dx));
+          return { yaw, yawDeg: radToDeg(yaw), source: 'manual_heading_arrow', label: '手动' };
+        }
+      }
+      if (selectedWaypoints.length >= 2) {
+        const prev = selectedWaypoints[selectedWaypoints.length - 2];
+        const dx = lastPoint.x - prev.x;
+        const dy = lastPoint.y - prev.y;
+        if (Math.hypot(dx, dy) > 0.001) {
+          const yaw = normalizeAngle(Math.atan2(dy, dx));
+          return { yaw, yawDeg: radToDeg(yaw), source: 'auto_last_segment', label: '自动' };
+        }
+      }
+      if (state?.odom?.yaw !== null && state?.odom?.yaw !== undefined) {
+        const yaw = normalizeAngle(Number(state.odom.yaw));
+        return { yaw, yawDeg: radToDeg(yaw), source: 'current_odom', label: '当前' };
+      }
+      return null;
+    }
+
+    function drawArrow(ctx, start, end, color, label) {
+      const dpr = window.devicePixelRatio || 1;
+      const angle = Math.atan2(end.y - start.y, end.x - start.x);
+      const head = 12 * dpr;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 4 * dpr;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(start.x, start.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(end.x, end.y);
+      ctx.lineTo(end.x - head * Math.cos(angle - Math.PI / 6), end.y - head * Math.sin(angle - Math.PI / 6));
+      ctx.lineTo(end.x - head * Math.cos(angle + Math.PI / 6), end.y - head * Math.sin(angle + Math.PI / 6));
+      ctx.closePath();
+      ctx.fill();
+      if (label) {
+        ctx.font = `${12 * dpr}px system-ui, sans-serif`;
+        ctx.lineWidth = 4 * dpr;
+        ctx.strokeStyle = '#ffffff';
+        ctx.strokeText(label, end.x + 8 * dpr, end.y - 8 * dpr);
+        ctx.fillText(label, end.x + 8 * dpr, end.y - 8 * dpr);
+      }
+      ctx.restore();
+    }
+
+    function drawTargetHeading(ctx, map, geom, state) {
+      const target = computeTargetYaw(state);
+      if (!target || !selectedWaypoints.length) return;
+      const lastPoint = selectedWaypoints[selectedWaypoints.length - 1];
+      const start = mapToCanvas(map, lastPoint.x, lastPoint.y, geom);
+      let end;
+      if (finalHeadingPoint) {
+        end = mapToCanvas(map, finalHeadingPoint.x, finalHeadingPoint.y, geom);
+      } else {
+        const dpr = window.devicePixelRatio || 1;
+        const len = 56 * dpr;
+        end = {
+          x: start.x + Math.cos(target.yaw) * len,
+          y: start.y - Math.sin(target.yaw) * len
+        };
+      }
+      drawArrow(ctx, start, end, '#16a34a', `${target.label} ${target.yawDeg.toFixed(1)}°`);
     }
 
     function drawSelectedWaypoints(ctx, map, geom) {
@@ -1149,6 +1263,7 @@ HTML = r"""<!doctype html>
       }
 
       drawSelectedWaypoints(ctx, map, geom);
+      drawTargetHeading(ctx, map, geom, state);
 
       document.getElementById('mapMeta').textContent =
         `${map.width}x${map.height}, ${fmt(map.resolution, 3, 'm/cell')}`;
@@ -1302,6 +1417,10 @@ HTML = r"""<!doctype html>
         : '--';
       const cmd = state.navigation?.last_command;
       document.getElementById('navCommand').textContent = cmd?.type ? `${cmd.type} #${cmd.seq || ''}` : '--';
+      const targetYaw = computeTargetYaw(state);
+      document.getElementById('targetYaw').textContent = targetYaw
+        ? `${targetYaw.yawDeg.toFixed(1)}° ${targetYaw.label}`
+        : '--';
       document.getElementById('scanValid').textContent = state.scan ? `${state.scan.valid_count}/${state.scan.count}` : '--';
       document.getElementById('scanMin').textContent = fmt(state.scan?.min_range, 3, 'm');
       document.getElementById('scanFrame').textContent = state.scan?.frame_id || '--';
@@ -1322,8 +1441,10 @@ HTML = r"""<!doctype html>
       const basic = state.navigation?.robot_basic_state;
       const slamState = state.navigation?.slamware_state?.state || '--';
       const planCount = state.navigation?.global_plan_path?.total_poses || 0;
+      const targetYaw = computeTargetYaw(state);
       const parts = [
         `<strong>${selectedWaypoints.length}</strong> 个航点`,
+        `目标角度: <strong>${targetYaw ? targetYaw.yawDeg.toFixed(1) + '° ' + targetYaw.label : '--'}</strong>`,
         `Slamware: <strong>${slamState}</strong>`,
         `定位: <strong>${basic ? (basic.is_localization_enabled ? 'ON' : 'OFF') + ' / ' + basic.localization_quality : '--'}</strong>`,
         `规划路径: <strong>${planCount}</strong> 点`
@@ -1373,6 +1494,8 @@ HTML = r"""<!doctype html>
       document.getElementById('stopNavigationBtn').disabled = busy;
       document.getElementById('undoWaypointBtn').disabled = busy;
       document.getElementById('clearWaypointsBtn').disabled = busy;
+      document.getElementById('setHeadingBtn').disabled = busy;
+      document.getElementById('clearHeadingBtn').disabled = busy;
     }
 
     function showNavMessage(kind, text) {
@@ -1396,19 +1519,49 @@ HTML = r"""<!doctype html>
       return data;
     }
 
+    function setHeadingMode(enabled) {
+      headingMode = Boolean(enabled);
+      document.getElementById('setHeadingBtn').classList.toggle('active', headingMode);
+      document.getElementById('navHint').textContent = headingMode
+        ? '在地图上点击终点需要朝向的方向'
+        : '在地图上点击添加航点';
+    }
+
+    function refreshMapUi() {
+      if (lastState) {
+        drawMap(lastState);
+        updateReadouts(lastState);
+        updateNavigationStatus(lastState);
+      }
+    }
+
+    function buildNavigationPayload() {
+      const payload = { waypoints: selectedWaypoints };
+      const targetYaw = computeTargetYaw(lastState);
+      if (targetYaw) {
+        payload.yaw = Number(targetYaw.yaw.toFixed(6));
+        payload.yaw_source = targetYaw.source;
+      }
+      return payload;
+    }
+
     async function startNavigation() {
       if (!selectedWaypoints.length) {
         showNavMessage('bad', '导航：<strong>请先在地图上点击选择至少一个航点</strong>');
         return;
       }
+      const targetYaw = computeTargetYaw(lastState);
       setNavButtonsBusy(true);
-      showNavMessage('', '导航：正在发送航点给 Slamware...');
+      showNavMessage('', `导航：正在发送航点和目标角度给 Slamware... ${targetYaw ? targetYaw.yawDeg.toFixed(1) + '° ' + targetYaw.label : ''}`);
       try {
-        const data = await postJson('/api/navigation/start', { waypoints: selectedWaypoints });
+        const data = await postJson('/api/navigation/start', buildNavigationPayload());
         if (data.ok) {
           const warnings = data.command?.safety?.warnings || [];
           const warningText = warnings.length ? `，警告：${warnings.join('；')}` : '';
-          showNavMessage(warnings.length ? 'warn' : '', `导航：<strong>已开始</strong>，航点 ${selectedWaypoints.length} 个${warningText}`);
+          const yawText = data.command?.yaw_deg !== null && data.command?.yaw_deg !== undefined
+            ? `，目标角度 ${Number(data.command.yaw_deg).toFixed(1)}°`
+            : '';
+          showNavMessage(warnings.length ? 'warn' : '', `导航：<strong>已开始</strong>，航点 ${selectedWaypoints.length} 个${yawText}${warningText}`);
         } else {
           const blockers = data.safety?.blockers || [];
           const details = blockers.length ? `：${blockers.join('；')}` : (data.error || 'unknown error');
@@ -1445,27 +1598,47 @@ HTML = r"""<!doctype html>
         showNavMessage('bad', '导航：<strong>点在地图外</strong>');
         return;
       }
+      if (headingMode) {
+        if (!selectedWaypoints.length) {
+          showNavMessage('bad', '导航：<strong>请先添加终点，再设置朝向</strong>');
+          setHeadingMode(false);
+          return;
+        }
+        finalHeadingPoint = { x: Number(p.x.toFixed(4)), y: Number(p.y.toFixed(4)) };
+        setHeadingMode(false);
+        refreshMapUi();
+        const targetYaw = computeTargetYaw(lastState);
+        showNavMessage('', `导航：已设置终点朝向 <strong>${targetYaw ? targetYaw.yawDeg.toFixed(1) : '--'}°</strong>`);
+        return;
+      }
       selectedWaypoints.push({ x: Number(p.x.toFixed(4)), y: Number(p.y.toFixed(4)) });
-      drawMap(lastState);
-      updateReadouts(lastState);
-      updateNavigationStatus(lastState);
+      finalHeadingPoint = null;
+      refreshMapUi();
     });
 
     document.getElementById('undoWaypointBtn').addEventListener('click', () => {
       selectedWaypoints.pop();
-      if (lastState) {
-        drawMap(lastState);
-        updateReadouts(lastState);
-        updateNavigationStatus(lastState);
-      }
+      finalHeadingPoint = null;
+      if (!selectedWaypoints.length) setHeadingMode(false);
+      refreshMapUi();
     });
     document.getElementById('clearWaypointsBtn').addEventListener('click', () => {
       selectedWaypoints = [];
-      if (lastState) {
-        drawMap(lastState);
-        updateReadouts(lastState);
-        updateNavigationStatus(lastState);
+      finalHeadingPoint = null;
+      setHeadingMode(false);
+      refreshMapUi();
+    });
+    document.getElementById('setHeadingBtn').addEventListener('click', () => {
+      if (!selectedWaypoints.length) {
+        showNavMessage('bad', '导航：<strong>请先添加至少一个航点，再设置朝向</strong>');
+        return;
       }
+      setHeadingMode(!headingMode);
+    });
+    document.getElementById('clearHeadingBtn').addEventListener('click', () => {
+      finalHeadingPoint = null;
+      setHeadingMode(false);
+      refreshMapUi();
     });
     document.getElementById('startNavigationBtn').addEventListener('click', startNavigation);
     document.getElementById('stopNavigationBtn').addEventListener('click', stopNavigation);

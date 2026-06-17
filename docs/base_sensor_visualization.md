@@ -84,11 +84,16 @@ http://127.0.0.1:18083/
 在 `SLAM Map + Odometry` 地图上点击即可添加航点：
 
 - 紫色点/虚线：网页手动选择的航点和直连预览。
+- 绿色箭头：终点目标朝向，对应发给 Slamware 的 `yaw`。
 - 橙色线：Slamware 底层发布的 `global_plan_path`。
 - `撤销点`：删除最后一个航点。
 - `清空点`：删除所有航点。
+- `设置朝向`：先选好航点，再点击该按钮，然后在地图上点一下终点需要面向的方向。
+- `清除朝向`：删除手动朝向，恢复为自动朝向。
 - `开始导航`：将航点发送到 `/slamware_ros_sdk_server_node/move_to_locations`。
 - `停止导航`：发送 `/slamware_ros_sdk_server_node/cancel_action`。
+
+如果没有手动设置朝向，页面会自动用最后一段路径方向计算终点 `yaw`。如果只有一个航点且没有手动朝向，后端会使用当前里程计 yaw。
 
 开始导航前，服务会检查地图、里程计、激光、超声/碰撞传感器是否新鲜，并检查航点是否在地图内、是否落在占用栅格上。碰撞/超声触发时不会启动导航。当前 `localization_quality=0` 默认只提示警告；如需强制限制，可以启动时增加 `--min-localization-quality N`。
 
@@ -118,7 +123,15 @@ curl -s http://127.0.0.1:18083/api/state
 ```bash
 curl -s -X POST http://127.0.0.1:18083/api/navigation/start \
   -H 'Content-Type: application/json' \
-  -d '{"waypoints":[{"x":1.0,"y":2.0},{"x":1.5,"y":2.5}]}'
+  -d '{"waypoints":[{"x":1.0,"y":2.0},{"x":1.5,"y":2.5}],"yaw_deg":90}'
+```
+
+`yaw` 也可以用弧度传：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/navigation/start \
+  -H 'Content-Type: application/json' \
+  -d '{"waypoints":[{"x":1.0,"y":2.0}],"yaw":1.5708,"yaw_source":"manual"}'
 ```
 
 停止导航：
