@@ -52,6 +52,8 @@ IMPACT_TYPE_NAMES = {
     1: "ANALOG",
 }
 
+SLAMWARE_MOVE_OPTION_WITH_YAW = 32
+
 
 def finite_or_none(value: Any, digits: Optional[int] = None) -> Optional[float]:
     try:
@@ -394,6 +396,7 @@ class BaseSensorNode(Node):
         if not yaw_result["ok"]:
             return yaw_result
         request.yaw = float(yaw_result["yaw"])
+        request.options.opt_flags.flags = int(request.options.opt_flags.flags) | SLAMWARE_MOVE_OPTION_WITH_YAW
 
         speed_ratio = payload.get("speed_ratio")
         if speed_ratio is not None:
@@ -404,26 +407,31 @@ class BaseSensorNode(Node):
             except (TypeError, ValueError):
                 return {"ok": False, "error": "invalid speed_ratio"}
 
-        self.move_to_locations_pub.publish(request)
+        dry_run = bool(payload.get("dry_run"))
         now = time.time()
         command = {
             "received_at": now,
             "type": "move_to_locations",
+            "dry_run": dry_run,
             "waypoints": waypoints,
             "yaw": finite_or_none(request.yaw, 5),
             "yaw_deg": finite_or_none(math.degrees(float(request.yaw)), 2),
             "yaw_source": yaw_result["source"],
+            "move_option_flags": int(request.options.opt_flags.flags),
+            "with_yaw": bool(int(request.options.opt_flags.flags) & SLAMWARE_MOVE_OPTION_WITH_YAW),
             "speed_ratio": finite_or_none(request.options.speed_ratio.value, 3)
             if request.options.speed_ratio.is_valid
             else None,
             "published_topic": "/slamware_ros_sdk_server_node/move_to_locations",
             "safety": safety,
         }
+        if not dry_run:
+            self.move_to_locations_pub.publish(request)
         with self.state.lock:
             self.state.seq["navigation_command"] += 1
             command["seq"] = self.state.seq["navigation_command"]
             self.state.last_navigation_command = command
-        return {"ok": True, "navigation_started": True, "command": command}
+        return {"ok": True, "navigation_started": not dry_run, "dry_run": dry_run, "command": command}
 
     def cancel_navigation(self) -> Dict[str, Any]:
         self.cancel_action_pub.publish(CancelActionRequest())

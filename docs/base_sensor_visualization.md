@@ -94,6 +94,7 @@ http://127.0.0.1:18083/
 - `停止导航`：发送 `/slamware_ros_sdk_server_node/cancel_action`。
 
 如果没有手动设置朝向，页面会自动用最后一段路径方向计算终点 `yaw`。如果只有一个航点且没有手动朝向，后端会使用当前里程计 yaw。
+服务发送导航请求时会同时设置 `MoveOptionFlag.WITH_YAW`，否则 Slamware 可能会忽略 `yaw` 字段并按路径方向结束。
 
 开始导航前，服务会检查地图、里程计、激光、超声/碰撞传感器是否新鲜，并检查航点是否在地图内、是否落在占用栅格上。碰撞/超声触发时不会启动导航。当前 `localization_quality=0` 默认只提示警告；如需强制限制，可以启动时增加 `--min-localization-quality N`。
 
@@ -132,6 +133,14 @@ curl -s -X POST http://127.0.0.1:18083/api/navigation/start \
 curl -s -X POST http://127.0.0.1:18083/api/navigation/start \
   -H 'Content-Type: application/json' \
   -d '{"waypoints":[{"x":1.0,"y":2.0}],"yaw":1.5708,"yaw_source":"manual"}'
+```
+
+只想看会发送什么、不让机器人动，可以加 `dry_run`：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/navigation/start \
+  -H 'Content-Type: application/json' \
+  -d '{"waypoints":[{"x":1.0,"y":2.0}],"yaw_deg":90,"dry_run":true}'
 ```
 
 停止导航：
