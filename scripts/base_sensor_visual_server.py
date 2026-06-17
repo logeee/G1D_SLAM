@@ -1178,7 +1178,7 @@ HTML = r"""<!doctype html>
       padding: 10px;
       border-bottom: 1px solid var(--line);
       display: grid;
-      grid-template-columns: 1fr 1fr auto;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 8px;
       background: #f8fafc;
     }
@@ -1233,9 +1233,10 @@ HTML = r"""<!doctype html>
       border: 1px solid var(--line);
       border-radius: 8px;
       background: #fff;
-      padding: 10px;
+      padding: 12px;
       overflow: hidden;
       cursor: grab;
+      min-height: 0;
     }
     .workflow-step:active { cursor: grabbing; }
     .workflow-step.dragging {
@@ -1266,20 +1267,25 @@ HTML = r"""<!doctype html>
     .workflow-step-content {
       position: relative;
       display: grid;
-      gap: 5px;
+      gap: 7px;
+      min-width: 0;
     }
     .workflow-title {
-      display: flex;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
       align-items: center;
-      justify-content: space-between;
       gap: 8px;
       font-weight: 750;
+      min-width: 0;
     }
     .workflow-title-left {
       display: inline-flex;
       align-items: center;
       gap: 6px;
       min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .drag-handle {
       color: var(--muted);
@@ -1289,17 +1295,24 @@ HTML = r"""<!doctype html>
       user-select: none;
     }
     .workflow-delete {
-      padding: 3px 8px;
+      padding: 4px 9px;
       font-size: 12px;
       font-weight: 700;
       border-color: #fecaca;
       color: #b91c1c;
       background: #fff7f7;
+      white-space: nowrap;
     }
     .workflow-detail {
       color: var(--muted);
       font-size: 12px;
+      line-height: 1.35;
       overflow-wrap: anywhere;
+    }
+    .workflow-progress-text {
+      color: #7c8aa0;
+      font-size: 12px;
+      line-height: 1.2;
     }
     .workflow-badge {
       display: inline-flex;
@@ -1607,6 +1620,7 @@ HTML = r"""<!doctype html>
             <button id="runWorkflowBtn" class="primary">执行动作链</button>
             <button id="startNavigationBtn">仅执行导航</button>
             <button id="stopNavigationBtn" class="danger">停止</button>
+            <button id="clearWorkflowBtn">清空动作</button>
           </div>
           <div class="workflow-actions">
             <div class="action-builder">
@@ -2375,6 +2389,7 @@ HTML = r"""<!doctype html>
     function setNavButtonsBusy(busy) {
       document.getElementById('startNavigationBtn').disabled = busy;
       document.getElementById('runWorkflowBtn').disabled = busy;
+      document.getElementById('clearWorkflowBtn').disabled = busy;
       document.getElementById('stopNavigationBtn').disabled = busy;
       document.getElementById('undoWaypointBtn').disabled = busy;
       document.getElementById('clearWaypointsBtn').disabled = busy;
@@ -2481,6 +2496,7 @@ HTML = r"""<!doctype html>
       const ids = [
         'startNavigationBtn',
         'runWorkflowBtn',
+        'clearWorkflowBtn',
         'undoWaypointBtn',
         'clearWaypointsBtn',
         'setHeadingBtn',
@@ -2569,6 +2585,23 @@ HTML = r"""<!doctype html>
       renderWorkflow();
     }
 
+    function clearWorkflowActions() {
+      if (workflowRun.running) {
+        showNavMessage('bad', '动作链执行中：<strong>请先停止后再清空动作</strong>');
+        return;
+      }
+      workflowActions = [];
+      selectedWaypoints = [];
+      finalHeadingPoint = null;
+      manualHeadingDeg = null;
+      draggedActionId = null;
+      document.getElementById('headingDegInput').value = '';
+      setHeadingMode(false);
+      resetWorkflowRun('已清空动作');
+      refreshMapUi();
+      showNavMessage('', '动作链：<strong>已清空所有动作</strong>');
+    }
+
     function workflowStepStatus(module, index) {
       if (workflowRun.error && index === workflowRun.currentIndex) return 'error';
       if (workflowRun.completed[module.id]) return 'done';
@@ -2649,10 +2682,10 @@ HTML = r"""<!doctype html>
             <div class="workflow-title">
               <span class="workflow-title-left"><span class="drag-handle">☰</span><span class="workflow-pulse"></span>${escapeHtml(actionTitle(module, index))}</span>
               <span class="workflow-badge">${badge}</span>
+              ${deleteButton}
             </div>
             <div class="workflow-detail">${escapeHtml(actionDetail(module))}</div>
-            <div class="workflow-detail">进度 ${progress}%</div>
-            ${deleteButton}
+            <div class="workflow-progress-text">进度 ${progress}%</div>
           </div>
         </div>`;
       }).join('');
@@ -3303,6 +3336,7 @@ HTML = r"""<!doctype html>
     document.getElementById('startNavigationBtn').addEventListener('click', startNavigation);
     document.getElementById('runWorkflowBtn').addEventListener('click', runWorkflow);
     document.getElementById('stopNavigationBtn').addEventListener('click', stopNavigation);
+    document.getElementById('clearWorkflowBtn').addEventListener('click', clearWorkflowActions);
     document.getElementById('newActionType').addEventListener('change', updateActionBuilderVisibility);
     document.getElementById('newActionPointSelect').addEventListener('change', onActionPointSelected);
     document.getElementById('fillCurrentPoseBtn').addEventListener('click', fillCurrentPoseForAction);

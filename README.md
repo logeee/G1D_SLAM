@@ -157,6 +157,7 @@ curl -s -X POST http://127.0.0.1:18083/api/navigation/cancel -d '{}'
 - `机械臂抓取` 会选择目标标签并发布 ROS JSON 到 `/arm_control/task_command`，目前目标标签为 `XiongMao` 和 `Xizi_Liqun`。
 - `机械臂放置` / `机械臂复位` 会发布 `PLACE` / `RESET`，`target_object` 留空。
 - 动作卡片支持拖拽排序，也可以单独删除。
+- `清空动作` 会清空整个动作链，包括导航动作和机械臂动作。
 - `执行动作链` 会按卡片顺序逐个执行：导航动作先到位，其他动作再执行。
 - `仅执行导航` 只用于调试导航，会跳过非导航动作。
 - 机械臂任务会等待 `/arm_control/task_status` 中同一个 `task_id` 的终态：`DONE` 成功，`FAILED` / `REJECTED` 失败，默认超时 120 秒。
