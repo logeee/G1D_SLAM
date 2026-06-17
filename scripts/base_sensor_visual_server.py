@@ -14,6 +14,7 @@ import math
 import os
 import signal
 import struct
+import subprocess
 import threading
 import time
 import uuid
@@ -357,6 +358,13 @@ class BaseSensorNode(Node):
         arm_status_topic: str,
         arm_task_timeout_sec: float,
         arm_stop_phases: Iterable[str],
+        column_control_bin: str,
+        column_control_workdir: str,
+        column_control_interface: str,
+        column_control_libdir: str,
+        column_height_timeout_sec: float,
+        column_height_min_m: float,
+        column_height_max_m: float,
         min_localization_quality: int,
         max_cloud_points: int,
     ) -> None:
@@ -370,6 +378,13 @@ class BaseSensorNode(Node):
         self.arm_stop_phases = [str(phase).strip().upper() for phase in arm_stop_phases if str(phase).strip()]
         if not self.arm_stop_phases:
             self.arm_stop_phases = ["RESET"]
+        self.column_control_bin = str(column_control_bin)
+        self.column_control_workdir = str(column_control_workdir)
+        self.column_control_interface = str(column_control_interface)
+        self.column_control_libdir = str(column_control_libdir)
+        self.column_height_timeout_sec = max(1.0, float(column_height_timeout_sec))
+        self.column_height_min_m = float(column_height_min_m)
+        self.column_height_max_m = float(column_height_max_m)
         self.arm_status_condition = threading.Condition()
         self.arm_status_by_task_id: Dict[str, List[Dict[str, Any]]] = {}
         qos = make_reliable_qos(depth=10)
@@ -810,6 +825,107 @@ class BaseSensorNode(Node):
             "arm_stop_phases": phases,
             "arm_commands": arm_commands,
             "message": "published navigation cancel and arm stop/reset commands",
+        }
+
+    def execute_column_height_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        target = finite_or_none(
+            payload.get(
+                "target_height_m",
+                payload.get("targetHeightM", payload.get("height_m", payload.get("heightM"))),
+            ),
+            4,
+        )
+        if target is None:
+            return {"ok": False, "error": "target_height_m is required", "received": payload}
+        if target < self.column_height_min_m or target > self.column_height_max_m:
+            return {
+                "ok": False,
+                "error": (
+                    f"target_height_m out of range "
+                    f"[{self.column_height_min_m:.3f}, {self.column_height_max_m:.3f}]"
+                ),
+                "target_height_m": target,
+                "received": payload,
+            }
+        timeout = finite_or_none(payload.get("timeout_sec", payload.get("timeoutSec", self.column_height_timeout_sec)), 2)
+        if timeout is None:
+            timeout = self.column_height_timeout_sec
+        timeout = max(1.0, min(180.0, float(timeout)))
+        dry_run = bool(payload.get("dry_run") or payload.get("dryRun"))
+        argv = [
+            self.column_control_bin,
+            self.column_control_interface,
+            f"{target:.4f}",
+        ]
+        workdir = self.column_control_workdir or None
+        env = os.environ.copy()
+        if self.column_control_libdir:
+            old_path = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = (
+                self.column_control_libdir
+                if not old_path
+                else f"{self.column_control_libdir}:{old_path}"
+            )
+        started_at = now_iso()
+        command = {
+            "type": "column_height",
+            "argv": argv,
+            "cwd": workdir,
+            "target_height_m": target,
+            "timeout_sec": timeout,
+            "dry_run": dry_run,
+        }
+        if dry_run:
+            return {
+                "ok": True,
+                "dry_run": True,
+                "type": "column_height",
+                "command": command,
+                "started_at": started_at,
+                "finished_at": now_iso(),
+            }
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=workdir,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            return {
+                "ok": False,
+                "error": f"column control binary not found: {exc}",
+                "type": "column_height",
+                "command": command,
+                "started_at": started_at,
+                "finished_at": now_iso(),
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "error": "column height command timeout",
+                "type": "column_height",
+                "command": command,
+                "returncode": None,
+                "stdout": exc.stdout or "",
+                "stderr": exc.stderr or "",
+                "started_at": started_at,
+                "finished_at": now_iso(),
+            }
+        ok = result.returncode == 0
+        return {
+            "ok": ok,
+            "error": None if ok else f"column height command failed with returncode {result.returncode}",
+            "type": "column_height",
+            "command": command,
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "started_at": started_at,
+            "finished_at": now_iso(),
         }
 
     def start_navigation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1706,6 +1822,7 @@ HTML = r"""<!doctype html>
                   <option value="arm_pick">机械臂抓取</option>
                   <option value="arm_place">机械臂放置</option>
                   <option value="arm_reset">机械臂复位</option>
+                  <option value="column_height">立柱升降</option>
                 </select>
               </label>
               <label class="nav-action-field">点位库
@@ -1731,13 +1848,19 @@ HTML = r"""<!doctype html>
               <label class="arm-action-field">超时 s
                 <input id="newArmTimeoutSec" type="number" step="1" min="1" max="600" value="120" />
               </label>
+              <label class="column-action-field">目标高度 m
+                <input id="newColumnTargetHeightM" type="number" step="0.001" min="-1" max="1" value="0" />
+              </label>
+              <label class="column-action-field">超时 s
+                <input id="newColumnTimeoutSec" type="number" step="1" min="1" max="180" value="30" />
+              </label>
             </div>
             <div class="action-builder-actions">
               <button id="fillCurrentPoseBtn">填当前位置</button>
               <button id="addWorkflowActionBtn" class="primary">增加动作</button>
               <button id="resetWorkflowBtn">重置状态</button>
             </div>
-            <div class="workflow-detail">导航动作可以从点位库选，也可以手动填位姿或直接点地图；机械臂抓取会把目标标签发给手臂模块。动作卡片可拖拽排序。</div>
+            <div class="workflow-detail">导航动作可以从点位库选，也可以手动填位姿或直接点地图；机械臂抓取会把目标标签发给手臂模块；立柱升降会调用 G1D 高度控制原始动作。动作卡片可拖拽排序。</div>
           </div>
           <div id="workflowList" class="workflow-list"></div>
         </aside>
@@ -2521,6 +2644,14 @@ HTML = r"""<!doctype html>
             index
           };
         }
+        if (action.type === 'column_height') {
+          return {
+            ...action,
+            title: action.title || '立柱升降',
+            timeoutSec: action.timeoutSec || 30,
+            index
+          };
+        }
         return {
           ...action,
           title: action.title || '拾取熊猫烟',
@@ -2590,6 +2721,8 @@ HTML = r"""<!doctype html>
         'newActionYawDeg',
         'newArmTargetObject',
         'newArmTimeoutSec',
+        'newColumnTargetHeightM',
+        'newColumnTimeoutSec',
         'fillCurrentPoseBtn',
         'addWorkflowActionBtn'
       ];
@@ -2712,7 +2845,7 @@ HTML = r"""<!doctype html>
       if (status === 'done') return 100;
       if (status !== 'running') return 0;
       if (module.type === 'navigate') return Math.round(estimateNavProgress(module, lastState) * 100);
-      if (module.type === 'arm_task' || module.type === 'fake_pick_xiongmao') {
+      if (module.type === 'arm_task' || module.type === 'column_height' || module.type === 'fake_pick_xiongmao') {
         if (!workflowRun.actionStartedAt) return 0;
         const elapsed = (Date.now() - workflowRun.actionStartedAt) / 1000;
         const total = Math.max(0.1, workflowRun.actionDurationSec || module.timeoutSec || module.durationSec || 5);
@@ -2733,6 +2866,7 @@ HTML = r"""<!doctype html>
     function actionTitle(action, index) {
       if (action.type === 'navigate') return `${index + 1}. ${action.title || '导航'}`;
       if (action.type === 'arm_task') return `${index + 1}. ${action.title || armActionTitle(action)}`;
+      if (action.type === 'column_height') return `${index + 1}. ${action.title || '立柱升降'}`;
       if (action.type === 'fake_pick_xiongmao') return `${index + 1}. 拾取熊猫烟`;
       return `${index + 1}. ${action.title || action.type || '动作'}`;
     }
@@ -2751,6 +2885,9 @@ HTML = r"""<!doctype html>
         const target = action.targetObject || action.target_object || '';
         const targetText = target ? `，目标=${target}` : '';
         return `ROS 手臂任务：phase=${phase}${targetText}，超时 ${action.timeoutSec || 120}s`;
+      }
+      if (action.type === 'column_height') {
+        return `G1D 立柱高度：target=${Number(action.targetHeightM || 0).toFixed(3)}m，超时 ${action.timeoutSec || 30}s`;
       }
       return '预留动作模块';
     }
@@ -3087,11 +3224,15 @@ HTML = r"""<!doctype html>
       const isNav = type === 'navigate';
       const isArm = type.startsWith('arm_');
       const isArmPick = type === 'arm_pick';
+      const isColumn = type === 'column_height';
       document.querySelectorAll('.nav-action-field').forEach(el => {
         el.style.display = isNav ? 'grid' : 'none';
       });
       document.querySelectorAll('.arm-action-field').forEach(el => {
         el.style.display = isArm ? 'grid' : 'none';
+      });
+      document.querySelectorAll('.column-action-field').forEach(el => {
+        el.style.display = isColumn ? 'grid' : 'none';
       });
       document.getElementById('newArmTargetObject').disabled = !isArmPick;
       document.getElementById('fillCurrentPoseBtn').style.display = isNav ? '' : 'none';
@@ -3154,6 +3295,28 @@ HTML = r"""<!doctype html>
         action.title = armActionTitle(action);
         addWorkflowAction(action);
         showNavMessage('', `动作链：已增加“${escapeHtml(action.title)}”`);
+        return;
+      }
+      if (type === 'column_height') {
+        const targetHeightM = Number(document.getElementById('newColumnTargetHeightM').value);
+        const timeoutSec = Number(document.getElementById('newColumnTimeoutSec').value || 30);
+        if (!Number.isFinite(targetHeightM)) {
+          showNavMessage('bad', '动作链：<strong>立柱升降需要有效目标高度</strong>');
+          return;
+        }
+        if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) {
+          showNavMessage('bad', '动作链：<strong>立柱升降需要有效超时时间</strong>');
+          return;
+        }
+        const action = {
+          id: makeActionId('column'),
+          type: 'column_height',
+          title: '立柱升降',
+          targetHeightM: Number(targetHeightM.toFixed(4)),
+          timeoutSec: Math.max(1, Math.min(180, Number(timeoutSec.toFixed(1))))
+        };
+        addWorkflowAction(action);
+        showNavMessage('', `动作链：已增加“立柱升降” target=${action.targetHeightM.toFixed(3)}m`);
         return;
       }
       addWorkflowAction({
@@ -3307,6 +3470,23 @@ HTML = r"""<!doctype html>
             if (!actionData.ok) {
               const statusText = actionData.final_status?.status_text || actionData.last_status?.status_text || '';
               throw new Error(actionData.error || statusText || '机械臂任务执行失败');
+            }
+            workflowRun.completed[action.id] = true;
+            continue;
+          }
+          if (action.type === 'column_height') {
+            workflowRun.actionStartedAt = Date.now();
+            workflowRun.actionDurationSec = action.timeoutSec || 30;
+            renderWorkflow();
+            showNavMessage('', `动作链：正在执行第 ${index + 1} 步“立柱升降” target=${Number(action.targetHeightM || 0).toFixed(3)}m...`);
+            const actionData = await postJson('/api/actions/execute', {
+              type: 'column_height',
+              target_height_m: Number(action.targetHeightM || 0),
+              timeout_sec: workflowRun.actionDurationSec,
+              name: action.title || '立柱升降'
+            });
+            if (!actionData.ok) {
+              throw new Error(actionData.error || '立柱升降执行失败');
             }
             workflowRun.completed[action.id] = true;
             continue;
@@ -3564,6 +3744,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def execute_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         action_type = str(payload.get("type") or payload.get("action") or "").strip()
+        if action_type in ("column_height", "column_lift", "g1d_column_height"):
+            return self.node_ref.execute_column_height_action(payload)
         if action_type in ("arm_task", "arm_pick", "arm_place", "arm_reset"):
             arm_payload = dict(payload)
             if action_type == "arm_pick":
@@ -3576,7 +3758,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if action_type != "fake_pick_xiongmao":
             return {
                 "ok": False,
-                "error": "unsupported action type; expected arm_task or fake_pick_xiongmao",
+                "error": "unsupported action type; expected arm_task, column_height, or fake_pick_xiongmao",
                 "received": payload,
             }
         duration = finite_or_none(payload.get("duration_sec", 5), 3)
@@ -3653,6 +3835,13 @@ def main() -> int:
         default="RESET,SUCTION_STOP,MOTION_STOP",
         help="Comma-separated arm phases published by the Stop button.",
     )
+    parser.add_argument("--column-control-bin", default="/home/unitree/unitree_sdk2/build/bin/g1d_height_control")
+    parser.add_argument("--column-control-workdir", default="/home/unitree/unitree_sdk2/build")
+    parser.add_argument("--column-control-interface", default="eth0")
+    parser.add_argument("--column-control-libdir", default="/home/unitree/unitree_sdk2/thirdparty/lib/aarch64")
+    parser.add_argument("--column-height-timeout-sec", type=float, default=30.0)
+    parser.add_argument("--column-height-min-m", type=float, default=-1.0)
+    parser.add_argument("--column-height-max-m", type=float, default=1.0)
     parser.add_argument("--points-file", default="data/nav_points.json")
     parser.add_argument(
         "--min-localization-quality",
@@ -3683,6 +3872,13 @@ def main() -> int:
         arm_status_topic=args.arm_status_topic,
         arm_task_timeout_sec=args.arm_task_timeout_sec,
         arm_stop_phases=args.arm_stop_phases.split(","),
+        column_control_bin=args.column_control_bin,
+        column_control_workdir=args.column_control_workdir,
+        column_control_interface=args.column_control_interface,
+        column_control_libdir=args.column_control_libdir,
+        column_height_timeout_sec=args.column_height_timeout_sec,
+        column_height_min_m=args.column_height_min_m,
+        column_height_max_m=args.column_height_max_m,
         min_localization_quality=args.min_localization_quality,
         max_cloud_points=args.max_cloud_points,
     )

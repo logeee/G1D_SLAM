@@ -152,10 +152,11 @@ curl -s -X POST http://127.0.0.1:18083/api/navigation/cancel -d '{}'
 
 `SLAM Map + Odometry` 右侧会显示当前动作链：
 
-- 点击 `增加动作` 可以把动作加入链表；动作类型当前有 `导航`、`机械臂抓取`、`机械臂放置`、`机械臂复位`。
+- 点击 `增加动作` 可以把动作加入链表；动作类型当前有 `导航`、`机械臂抓取`、`机械臂放置`、`机械臂复位`、`立柱升降`。
 - `导航` 动作可以直接选择点位库里的点位，自动填入 `x/y/yaw_deg`；也可以手动输入，或直接在地图上点击快速增加导航动作。
 - `机械臂抓取` 会选择目标标签并发布 ROS JSON 到 `/arm_control/task_command`，目前目标标签为 `XiongMao` 和 `Xizi_Liqun`。
 - `机械臂放置` / `机械臂复位` 会发布 `PLACE` / `RESET`，`target_object` 留空。
+- `立柱升降` 是原始动作，默认调用 `/home/unitree/unitree_sdk2/build/bin/g1d_height_control eth0 <目标高度m>`。
 - 动作卡片支持拖拽排序，也可以单独删除。
 - `清空动作` 会清空整个动作链，包括导航动作和机械臂动作。
 - `执行动作链` 会按卡片顺序逐个执行：导航动作先到位，其他动作再执行。导航动作完成条件是距离目标点 180mm 内、目标 yaw 偏差 4 度内，并连续稳定约 1.2 秒。
@@ -191,6 +192,18 @@ curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
 curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
   -H 'Content-Type: application/json' \
   -d '{"type":"arm_task","phase":"RESET","target_object":"","timeout_sec":120}'
+```
+
+立柱升降原始动作 API：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"column_height","target_height_m":0.0,"timeout_sec":30}'
+
+curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"column_height","target_height_m":0.247,"timeout_sec":30,"dry_run":true}'
 ```
 
 只验证不发布给机械臂时，加 `dry_run:true`：
