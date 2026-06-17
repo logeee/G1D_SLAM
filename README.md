@@ -154,7 +154,7 @@ curl -s -X POST http://127.0.0.1:18083/api/navigation/cancel -d '{}'
 
 - 点击 `增加动作` 可以把动作加入链表；动作类型当前有 `导航`、`机械臂抓取`、`机械臂放置`、`机械臂复位`、`立柱升降`。
 - `导航` 动作可以直接选择点位库里的点位，自动填入 `x/y/yaw_deg`；也可以手动输入，或直接在地图上点击快速增加导航动作。
-- `机械臂抓取` 会选择目标标签并发布 ROS JSON 到 `/arm_control/task_command`，目前目标标签为 `XiongMao` 和 `Xizi_Liqun`。
+- `机械臂抓取` 会选择目标标签并发布 ROS JSON 到 `/arm_control_refactor/task_command`，目前目标标签为 `XiongMao` 和 `Xizi_Liqun`。
 - `机械臂放置` / `机械臂复位` 会发布 `PLACE` / `RESET`，`target_object` 留空。
 - `立柱升降` 是原始动作，默认调用 `/home/unitree/unitree_sdk2/build/bin/g1d_height_control eth0 <目标高度m>`。
 - 动作卡片支持拖拽排序，也可以单独删除。
@@ -162,7 +162,7 @@ curl -s -X POST http://127.0.0.1:18083/api/navigation/cancel -d '{}'
 - `执行动作链` 会按卡片顺序逐个执行：导航动作先到位，其他动作再执行。导航动作完成条件是距离目标点 180mm 内、目标 yaw 偏差 4 度内，并连续稳定约 1.2 秒。
 - `仅执行导航` 只用于调试导航，会跳过非导航动作。
 - `停止` 会取消 Slamware 导航，并向机械臂发布停止/复位 phase。默认发布 `RESET`、`SUCTION_STOP`、`MOTION_STOP`，可用 `--arm-stop-phases` 调整。
-- 机械臂任务会等待 `/arm_control/task_status` 中同一个 `task_id` 的终态：`DONE` 成功，`FAILED` / `REJECTED` 失败，默认超时 120 秒。
+- 机械臂任务会等待 `/arm_control_refactor/task_status` 中同一个 `task_id` 的终态：`DONE` 成功，`FAILED` / `REJECTED` 失败，默认超时 120 秒。
 
 点位 API：
 
@@ -216,8 +216,8 @@ curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
 
 对应机械臂模块文档 v2.0：
 
-- 指令 Topic：`/arm_control/task_command`
-- 状态 Topic：`/arm_control/task_status`
+- 指令 Topic：`/arm_control_refactor/task_command`
+- 状态 Topic：`/arm_control_refactor/task_status`
 - 消息类型：`std_msgs/String`
 - 指令 JSON 核心字段：`task_id` / `phase` / `target_object`
 - `phase` 取值：`RESET` / `PICK` / `PLACE`
