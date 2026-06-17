@@ -993,6 +993,18 @@ HTML = r"""<!doctype html>
       align-items: baseline;
     }
     .workflow-head strong { font-size: 15px; }
+    .workflow-control-row {
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 8px;
+      background: #f8fafc;
+    }
+    .workflow-control-row button {
+      width: 100%;
+      min-height: 38px;
+    }
     .workflow-actions {
       padding: 10px;
       border-bottom: 1px solid var(--line);
@@ -1001,7 +1013,7 @@ HTML = r"""<!doctype html>
     }
     .action-builder {
       display: grid;
-      grid-template-columns: minmax(120px, 0.9fr) repeat(3, minmax(72px, 0.7fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 8px;
       align-items: end;
     }
@@ -1390,10 +1402,7 @@ HTML = r"""<!doctype html>
         <button id="clearHeadingBtn">清除朝向</button>
         <input id="headingDegInput" class="heading-input" type="number" step="1" min="-180" max="180" placeholder="角度°" />
         <button id="applyHeadingDegBtn">应用角度</button>
-        <button id="startNavigationBtn" class="primary">开始导航</button>
-        <button id="runWorkflowBtn" class="primary">执行动作链</button>
-        <button id="stopNavigationBtn" class="danger">停止导航</button>
-        <span id="navHint" class="nav-hint">在地图上点击添加航点</span>
+        <span id="navHint" class="nav-hint">在地图上点击快速增加导航动作</span>
       </div>
       <div id="navStatus" class="nav-status">导航：等待选点</div>
       <div class="readout">
@@ -1413,12 +1422,22 @@ HTML = r"""<!doctype html>
             <strong>动作链</strong>
             <span id="workflowMeta" class="meta">待执行</span>
           </div>
+          <div class="workflow-control-row">
+            <button id="runWorkflowBtn" class="primary">执行动作链</button>
+            <button id="startNavigationBtn">仅执行导航</button>
+            <button id="stopNavigationBtn" class="danger">停止</button>
+          </div>
           <div class="workflow-actions">
             <div class="action-builder">
               <label>动作类型
                 <select id="newActionType">
                   <option value="navigate">导航</option>
                   <option value="fake_pick_xiongmao">拾取熊猫烟</option>
+                </select>
+              </label>
+              <label class="nav-action-field">点位库
+                <select id="newActionPointSelect">
+                  <option value="">手动输入 / 地图点选</option>
                 </select>
               </label>
               <label class="nav-action-field">X m
@@ -1436,7 +1455,7 @@ HTML = r"""<!doctype html>
               <button id="addWorkflowActionBtn" class="primary">增加动作</button>
               <button id="resetWorkflowBtn">重置状态</button>
             </div>
-            <div class="workflow-detail">导航动作需要位姿；也可以直接在地图上点击快速增加导航动作。动作卡片可拖拽排序。</div>
+            <div class="workflow-detail">导航动作可以从点位库选，也可以手动填位姿或直接点地图。动作卡片可拖拽排序。</div>
           </div>
           <div id="workflowList" class="workflow-list"></div>
         </aside>
@@ -1614,6 +1633,10 @@ HTML = r"""<!doctype html>
         if (workflowActions[i].type === 'navigate') return workflowActions[i];
       }
       return null;
+    }
+
+    function getSavedPointById(pointId) {
+      return savedPoints.find(point => point.id === pointId) || null;
     }
 
     function syncSelectedWaypointsFromActions() {
@@ -2265,6 +2288,7 @@ HTML = r"""<!doctype html>
         'applyHeadingDegBtn',
         'addPointToNavBtn',
         'newActionType',
+        'newActionPointSelect',
         'newActionX',
         'newActionY',
         'newActionYawDeg',
@@ -2364,7 +2388,7 @@ HTML = r"""<!doctype html>
     }
 
     function actionTitle(action, index) {
-      if (action.type === 'navigate') return `${index + 1}. 导航`;
+      if (action.type === 'navigate') return `${index + 1}. ${action.title || '导航'}`;
       if (action.type === 'fake_pick_xiongmao') return `${index + 1}. 拾取熊猫烟`;
       return `${index + 1}. ${action.title || action.type || '动作'}`;
     }
@@ -2372,7 +2396,8 @@ HTML = r"""<!doctype html>
     function actionDetail(action) {
       if (action.type === 'navigate') {
         const yawText = Number.isFinite(Number(action.yawDeg)) ? `, yaw=${Number(action.yawDeg).toFixed(1)}°` : '';
-        return `目标 x=${Number(action.x).toFixed(3)}m, y=${Number(action.y).toFixed(3)}m${yawText}`;
+        const pointText = action.pointName ? `，点位库：${action.pointName}` : '';
+        return `目标 x=${Number(action.x).toFixed(3)}m, y=${Number(action.y).toFixed(3)}m${yawText}${pointText}`;
       }
       if (action.type === 'fake_pick_xiongmao') {
         return `假动作模块：后端休眠 ${action.durationSec || 5}s，后续可替换为机械臂动作`;
@@ -2529,6 +2554,7 @@ HTML = r"""<!doctype html>
           editingPointId = null;
         }
         renderSavedPoints();
+        refreshActionPointOptions();
         document.getElementById('pointsMeta').textContent = `${savedPoints.length} saved`;
         refreshMapUi();
       } catch (err) {
@@ -2638,7 +2664,9 @@ HTML = r"""<!doctype html>
       addWorkflowAction({
         id: makeActionId('nav'),
         type: 'navigate',
-        title: payload.name || '导航',
+        title: payload.name ? `导航到 ${payload.name}` : '导航',
+        pointId: editingPointId || null,
+        pointName: payload.name || '',
         x: Number(payload.x.toFixed(4)),
         y: Number(payload.y.toFixed(4)),
         yawDeg: Number(radToDeg(normalizeAngle(payload.yaw_deg * Math.PI / 180)).toFixed(3))
@@ -2649,10 +2677,41 @@ HTML = r"""<!doctype html>
       setPointMessage('ok', `已加入动作链：${payload.name || '导航'}，朝向 ${Number(payload.yaw_deg).toFixed(1)}°`);
     }
 
-    function setActionPoseInputs(x, y, yawDeg) {
+    function setActionPointSelection(pointId = '') {
+      const select = document.getElementById('newActionPointSelect');
+      if (select) select.value = pointId || '';
+    }
+
+    function refreshActionPointOptions() {
+      const select = document.getElementById('newActionPointSelect');
+      if (!select) return;
+      const previous = select.value;
+      const options = ['<option value="">手动输入 / 地图点选</option>'].concat(
+        savedPoints.map(point => {
+          const name = point.name || 'Point';
+          const yaw = Number(point.yaw_deg || 0).toFixed(1);
+          return `<option value="${escapeHtml(point.id)}">${escapeHtml(name)} (${Number(point.x).toFixed(3)}, ${Number(point.y).toFixed(3)}, ${yaw}°)</option>`;
+        })
+      );
+      select.innerHTML = options.join('');
+      if (previous && savedPoints.some(point => point.id === previous)) {
+        select.value = previous;
+      }
+    }
+
+    function setActionPoseInputs(x, y, yawDeg, options = {}) {
+      if (!options.keepPointSelection) setActionPointSelection('');
       if (x !== null && x !== undefined) document.getElementById('newActionX').value = Number(x).toFixed(4);
       if (y !== null && y !== undefined) document.getElementById('newActionY').value = Number(y).toFixed(4);
       if (yawDeg !== null && yawDeg !== undefined) document.getElementById('newActionYawDeg').value = Number(yawDeg).toFixed(1);
+    }
+
+    function onActionPointSelected() {
+      const select = document.getElementById('newActionPointSelect');
+      const point = select ? getSavedPointById(select.value) : null;
+      if (!point) return;
+      setActionPoseInputs(point.x, point.y, point.yaw_deg || 0, { keepPointSelection: true });
+      showNavMessage('', `动作链：已选择点位库 <strong>${escapeHtml(point.name || 'Point')}</strong>`);
     }
 
     function fillCurrentPoseForAction() {
@@ -2674,10 +2733,11 @@ HTML = r"""<!doctype html>
     function addActionFromBuilder() {
       const type = document.getElementById('newActionType').value;
       if (type === 'navigate') {
-        const x = Number(document.getElementById('newActionX').value);
-        const y = Number(document.getElementById('newActionY').value);
-        const rawYaw = document.getElementById('newActionYawDeg').value;
-        const yawDeg = rawYaw === '' ? (lastState?.odom?.yaw_deg || 0) : Number(rawYaw);
+        const selectedPoint = getSavedPointById(document.getElementById('newActionPointSelect')?.value || '');
+        const x = selectedPoint ? Number(selectedPoint.x) : Number(document.getElementById('newActionX').value);
+        const y = selectedPoint ? Number(selectedPoint.y) : Number(document.getElementById('newActionY').value);
+        const rawYaw = selectedPoint ? selectedPoint.yaw_deg : document.getElementById('newActionYawDeg').value;
+        const yawDeg = rawYaw === '' || rawYaw === null || rawYaw === undefined ? (lastState?.odom?.yaw_deg || 0) : Number(rawYaw);
         if (!Number.isFinite(x) || !Number.isFinite(y)) {
           showNavMessage('bad', '动作链：<strong>导航动作需要有效的 X / Y</strong>');
           return;
@@ -2689,12 +2749,15 @@ HTML = r"""<!doctype html>
         addWorkflowAction({
           id: makeActionId('nav'),
           type: 'navigate',
-          title: '导航',
+          title: selectedPoint ? `导航到 ${selectedPoint.name || '点位'}` : '导航',
+          pointId: selectedPoint?.id || null,
+          pointName: selectedPoint?.name || '',
           x: Number(x.toFixed(4)),
           y: Number(y.toFixed(4)),
           yawDeg: Number(radToDeg(normalizeAngle(yawDeg * Math.PI / 180)).toFixed(3))
         });
-        showNavMessage('', `动作链：已增加导航动作 x=${x.toFixed(3)}, y=${y.toFixed(3)}`);
+        const sourceText = selectedPoint ? `（点位库：${escapeHtml(selectedPoint.name || 'Point')}）` : '';
+        showNavMessage('', `动作链：已增加导航动作${sourceText} x=${x.toFixed(3)}, y=${y.toFixed(3)}`);
         return;
       }
       addWorkflowAction({
@@ -2967,6 +3030,7 @@ HTML = r"""<!doctype html>
     document.getElementById('runWorkflowBtn').addEventListener('click', runWorkflow);
     document.getElementById('stopNavigationBtn').addEventListener('click', stopNavigation);
     document.getElementById('newActionType').addEventListener('change', updateActionBuilderVisibility);
+    document.getElementById('newActionPointSelect').addEventListener('change', onActionPointSelected);
     document.getElementById('fillCurrentPoseBtn').addEventListener('click', fillCurrentPoseForAction);
     document.getElementById('addWorkflowActionBtn').addEventListener('click', addActionFromBuilder);
     document.getElementById('resetWorkflowBtn').addEventListener('click', () => resetWorkflowRun('待执行'));
