@@ -103,6 +103,8 @@ class SharedState:
         self.global_plan_path: Optional[Dict[str, Any]] = None
         self.robot_basic_state: Optional[Dict[str, Any]] = None
         self.slamware_state: Optional[Dict[str, Any]] = None
+        self.arm_task_status: Optional[Dict[str, Any]] = None
+        self.last_arm_task_command: Optional[Dict[str, Any]] = None
         self.last_navigation_command: Optional[Dict[str, Any]] = None
         self.track: deque[Dict[str, float]] = deque(maxlen=max_track)
         self.seq = {
@@ -115,6 +117,8 @@ class SharedState:
             "robot_basic_state": 0,
             "slamware_state": 0,
             "navigation_command": 0,
+            "arm_task_status": 0,
+            "arm_task_command": 0,
         }
 
     def snapshot(self) -> Dict[str, Any]:
@@ -137,6 +141,10 @@ class SharedState:
                     "slamware_state": self.slamware_state,
                     "last_command": self.last_navigation_command,
                 },
+                "arm_control": {
+                    "last_status": self.arm_task_status,
+                    "last_command": self.last_arm_task_command,
+                },
                 "freshness_s": {
                     "scan": self._age(self.scan, now),
                     "map": self._age(self.map, now),
@@ -146,6 +154,7 @@ class SharedState:
                     "global_plan_path": self._age(self.global_plan_path, now),
                     "robot_basic_state": self._age(self.robot_basic_state, now),
                     "slamware_state": self._age(self.slamware_state, now),
+                    "arm_task_status": self._age(self.arm_task_status, now),
                 },
             }
 
@@ -344,6 +353,9 @@ class BaseSensorNode(Node):
         global_plan_path_topic: str,
         robot_basic_state_topic: str,
         slamware_state_topic: str,
+        arm_command_topic: str,
+        arm_status_topic: str,
+        arm_task_timeout_sec: float,
         min_localization_quality: int,
         max_cloud_points: int,
     ) -> None:
@@ -351,6 +363,11 @@ class BaseSensorNode(Node):
         self.state = state
         self.max_cloud_points = max(10, int(max_cloud_points))
         self.min_localization_quality = int(min_localization_quality)
+        self.arm_command_topic = arm_command_topic
+        self.arm_status_topic = arm_status_topic
+        self.arm_task_timeout_sec = max(1.0, float(arm_task_timeout_sec))
+        self.arm_status_condition = threading.Condition()
+        self.arm_status_by_task_id: Dict[str, List[Dict[str, Any]]] = {}
         qos = make_reliable_qos(depth=10)
         self.create_subscription(LaserScan, scan_topic, self.on_scan, qos)
         self.create_subscription(OccupancyGrid, map_topic, self.on_map, qos)
@@ -361,14 +378,16 @@ class BaseSensorNode(Node):
         self.create_subscription(Path, global_plan_path_topic, self.on_global_plan_path, qos)
         self.create_subscription(RobotBasicState, robot_basic_state_topic, self.on_robot_basic_state, qos)
         self.create_subscription(String, slamware_state_topic, self.on_slamware_state, qos)
+        self.create_subscription(String, arm_status_topic, self.on_arm_task_status, qos)
         pointcloud_topics = [topic for topic in pointcloud_topics if topic]
         for topic in pointcloud_topics:
             self.create_subscription(PointCloud2, topic, self.make_point_cloud_cb(topic), qos)
         self.move_to_locations_pub = self.create_publisher(MoveToLocationsRequest, move_to_locations_topic, qos)
         self.cancel_action_pub = self.create_publisher(CancelActionRequest, cancel_action_topic, qos)
+        self.arm_task_command_pub = self.create_publisher(String, arm_command_topic, qos)
         self.get_logger().info(
             f"subscribed scan={scan_topic} map={map_topic} sensors={sensors_topic} "
-            f"pointclouds={pointcloud_topics} plan={global_plan_path_topic}"
+            f"pointclouds={pointcloud_topics} plan={global_plan_path_topic} arm_status={arm_status_topic}"
         )
 
     def on_scan(self, msg: LaserScan) -> None:
@@ -554,6 +573,168 @@ class BaseSensorNode(Node):
             self.state.seq["slamware_state"] += 1
             payload["seq"] = self.state.seq["slamware_state"]
             self.state.slamware_state = payload
+
+    def on_arm_task_status(self, msg: String) -> None:
+        now = time.time()
+        raw = str(msg.data)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            parsed = {"raw": raw, "parse_error": str(exc)}
+        if not isinstance(parsed, dict):
+            parsed = {"raw": raw, "parse_error": "status payload is not a JSON object"}
+        payload = {
+            "received_at": now,
+            "raw": raw,
+            "task_id": str(parsed.get("task_id") or ""),
+            "phase": str(parsed.get("phase") or ""),
+            "exec_status": finite_or_none(parsed.get("exec_status")),
+            "status_text": str(parsed.get("status_text") or ""),
+            "message": parsed.get("message"),
+            "timestamp": finite_or_none(parsed.get("timestamp"), 3),
+            "parsed": parsed,
+        }
+        with self.state.lock:
+            self.state.seq["arm_task_status"] += 1
+            payload["seq"] = self.state.seq["arm_task_status"]
+            self.state.arm_task_status = payload
+        task_id = payload["task_id"]
+        if task_id:
+            with self.arm_status_condition:
+                history = self.arm_status_by_task_id.setdefault(task_id, [])
+                history.append(payload)
+                if len(history) > 30:
+                    del history[:-30]
+                if len(self.arm_status_by_task_id) > 100:
+                    for old_task_id in list(self.arm_status_by_task_id.keys())[:-80]:
+                        self.arm_status_by_task_id.pop(old_task_id, None)
+                self.arm_status_condition.notify_all()
+
+    def execute_arm_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        phase = str(payload.get("phase") or "").strip().upper()
+        phase_map = {
+            "ARM_PICK": "PICK",
+            "PICK": "PICK",
+            "ARM_PLACE": "PLACE",
+            "PLACE": "PLACE",
+            "ARM_RESET": "RESET",
+            "RESET": "RESET",
+        }
+        phase = phase_map.get(phase, phase)
+        if phase not in {"RESET", "PICK", "PLACE"}:
+            return {"ok": False, "error": "invalid arm phase; expected RESET / PICK / PLACE", "received": payload}
+
+        target_object = str(payload.get("target_object") or payload.get("targetObject") or "").strip()
+        if phase == "PICK" and not target_object:
+            return {"ok": False, "error": "target_object is required for PICK", "received": payload}
+        if phase != "PICK":
+            target_object = ""
+
+        timeout = finite_or_none(payload.get("timeout_sec", payload.get("timeoutSec", self.arm_task_timeout_sec)), 3)
+        if timeout is None:
+            timeout = self.arm_task_timeout_sec
+        timeout = max(1.0, min(600.0, float(timeout)))
+        task_id = str(payload.get("task_id") or "").strip()
+        if not task_id:
+            target_part = target_object.lower() if target_object else "none"
+            task_id = f"arm_{phase.lower()}_{target_part}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+        command = {
+            "task_id": task_id,
+            "phase": phase,
+            "target_object": target_object,
+        }
+        dry_run = bool(payload.get("dry_run") or payload.get("dryRun"))
+        started_at = now_iso()
+        command_meta = {
+            "received_at": time.time(),
+            "task_id": task_id,
+            "phase": phase,
+            "target_object": target_object,
+            "published_topic": self.arm_command_topic,
+            "status_topic": self.arm_status_topic,
+            "dry_run": dry_run,
+            "timeout_sec": timeout,
+            "command": command,
+        }
+        with self.state.lock:
+            self.state.seq["arm_task_command"] += 1
+            command_meta["seq"] = self.state.seq["arm_task_command"]
+            self.state.last_arm_task_command = command_meta
+
+        if dry_run:
+            return {
+                "ok": True,
+                "dry_run": True,
+                "type": "arm_task",
+                "task_id": task_id,
+                "phase": phase,
+                "target_object": target_object,
+                "command": command,
+                "command_topic": self.arm_command_topic,
+                "status_topic": self.arm_status_topic,
+                "started_at": started_at,
+                "finished_at": now_iso(),
+            }
+
+        msg = String()
+        msg.data = json.dumps(command, ensure_ascii=False)
+        with self.arm_status_condition:
+            self.arm_status_by_task_id.pop(task_id, None)
+        self.arm_task_command_pub.publish(msg)
+
+        deadline = time.time() + timeout
+        final_status: Optional[Dict[str, Any]] = None
+        terminal_codes = {2, 3, 4}
+        terminal_texts = {"DONE", "FAILED", "REJECTED"}
+        while time.time() < deadline:
+            remaining = max(0.0, deadline - time.time())
+            with self.arm_status_condition:
+                self.arm_status_condition.wait(timeout=min(0.5, remaining))
+                history = list(self.arm_status_by_task_id.get(task_id, []))
+            if history:
+                latest = history[-1]
+                status_code = latest.get("exec_status")
+                status_text = str(latest.get("status_text") or "").upper()
+                if status_code in terminal_codes or status_text in terminal_texts:
+                    final_status = latest
+                    break
+
+        with self.arm_status_condition:
+            status_history = list(self.arm_status_by_task_id.get(task_id, []))
+        if not final_status:
+            return {
+                "ok": False,
+                "error": "arm task timeout waiting for terminal status",
+                "type": "arm_task",
+                "task_id": task_id,
+                "phase": phase,
+                "target_object": target_object,
+                "command": command,
+                "status_history": status_history,
+                "last_status": status_history[-1] if status_history else None,
+                "timeout_sec": timeout,
+                "started_at": started_at,
+                "finished_at": now_iso(),
+            }
+
+        status_text = str(final_status.get("status_text") or "").upper()
+        exec_status = final_status.get("exec_status")
+        ok = exec_status == 2 or status_text == "DONE"
+        return {
+            "ok": ok,
+            "error": None if ok else f"arm task ended with {status_text or exec_status}",
+            "type": "arm_task",
+            "task_id": task_id,
+            "phase": phase,
+            "target_object": target_object,
+            "command": command,
+            "final_status": final_status,
+            "status_history": status_history,
+            "timeout_sec": timeout,
+            "started_at": started_at,
+            "finished_at": now_iso(),
+        }
 
     def start_navigation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         waypoints, parse_errors = self.parse_waypoints(payload.get("waypoints", payload.get("points", [])))
@@ -1432,7 +1613,9 @@ HTML = r"""<!doctype html>
               <label>动作类型
                 <select id="newActionType">
                   <option value="navigate">导航</option>
-                  <option value="fake_pick_xiongmao">拾取熊猫烟</option>
+                  <option value="arm_pick">机械臂抓取</option>
+                  <option value="arm_place">机械臂放置</option>
+                  <option value="arm_reset">机械臂复位</option>
                 </select>
               </label>
               <label class="nav-action-field">点位库
@@ -1449,13 +1632,22 @@ HTML = r"""<!doctype html>
               <label class="nav-action-field">Yaw deg
                 <input id="newActionYawDeg" type="number" step="0.1" placeholder="当前" />
               </label>
+              <label class="arm-action-field">抓取目标
+                <select id="newArmTargetObject">
+                  <option value="XiongMao">XiongMao / 熊猫烟</option>
+                  <option value="Xizi_Liqun">Xizi_Liqun / 西子利群</option>
+                </select>
+              </label>
+              <label class="arm-action-field">超时 s
+                <input id="newArmTimeoutSec" type="number" step="1" min="1" max="600" value="120" />
+              </label>
             </div>
             <div class="action-builder-actions">
               <button id="fillCurrentPoseBtn">填当前位置</button>
               <button id="addWorkflowActionBtn" class="primary">增加动作</button>
               <button id="resetWorkflowBtn">重置状态</button>
             </div>
-            <div class="workflow-detail">导航动作可以从点位库选，也可以手动填位姿或直接点地图。动作卡片可拖拽排序。</div>
+            <div class="workflow-detail">导航动作可以从点位库选，也可以手动填位姿或直接点地图；机械臂抓取会把目标标签发给手臂模块。动作卡片可拖拽排序。</div>
           </div>
           <div id="workflowList" class="workflow-list"></div>
         </aside>
@@ -2172,7 +2364,8 @@ HTML = r"""<!doctype html>
           } : null,
           sensors: state.sensors,
           map: state.map ? { frame_id: state.map.frame_id, width: state.map.width, height: state.map.height, resolution: state.map.resolution, origin: state.map.origin } : null,
-          navigation: state.navigation
+          navigation: state.navigation,
+          arm_control: state.arm_control
         }, null, 2);
       } catch (err) {
         setStatus(false, `offline: ${err}`);
@@ -2224,6 +2417,14 @@ HTML = r"""<!doctype html>
             title: action.title || '导航',
             index,
             navIndex: getNavigationActions().findIndex(nav => nav.id === action.id)
+          };
+        }
+        if (action.type === 'arm_task') {
+          return {
+            ...action,
+            title: action.title || armActionTitle(action),
+            timeoutSec: action.timeoutSec || 120,
+            index
           };
         }
         return {
@@ -2292,6 +2493,8 @@ HTML = r"""<!doctype html>
         'newActionX',
         'newActionY',
         'newActionYawDeg',
+        'newArmTargetObject',
+        'newArmTimeoutSec',
         'fillCurrentPoseBtn',
         'addWorkflowActionBtn'
       ];
@@ -2378,17 +2581,27 @@ HTML = r"""<!doctype html>
       if (status === 'done') return 100;
       if (status !== 'running') return 0;
       if (module.type === 'navigate') return Math.round(estimateNavProgress(module, lastState) * 100);
-      if (module.type === 'fake_pick_xiongmao') {
+      if (module.type === 'arm_task' || module.type === 'fake_pick_xiongmao') {
         if (!workflowRun.actionStartedAt) return 0;
         const elapsed = (Date.now() - workflowRun.actionStartedAt) / 1000;
-        const total = Math.max(0.1, workflowRun.actionDurationSec || module.durationSec || 5);
+        const total = Math.max(0.1, workflowRun.actionDurationSec || module.timeoutSec || module.durationSec || 5);
         return Math.round(Math.max(0, Math.min(1, elapsed / total)) * 100);
       }
       return 0;
     }
 
+    function armActionTitle(action) {
+      const phase = String(action.phase || '').toUpperCase();
+      const target = action.targetObject || action.target_object || '';
+      if (phase === 'PICK') return `机械臂抓取 ${target || '目标'}`;
+      if (phase === 'PLACE') return '机械臂放置';
+      if (phase === 'RESET') return '机械臂复位';
+      return '机械臂任务';
+    }
+
     function actionTitle(action, index) {
       if (action.type === 'navigate') return `${index + 1}. ${action.title || '导航'}`;
+      if (action.type === 'arm_task') return `${index + 1}. ${action.title || armActionTitle(action)}`;
       if (action.type === 'fake_pick_xiongmao') return `${index + 1}. 拾取熊猫烟`;
       return `${index + 1}. ${action.title || action.type || '动作'}`;
     }
@@ -2401,6 +2614,12 @@ HTML = r"""<!doctype html>
       }
       if (action.type === 'fake_pick_xiongmao') {
         return `假动作模块：后端休眠 ${action.durationSec || 5}s，后续可替换为机械臂动作`;
+      }
+      if (action.type === 'arm_task') {
+        const phase = String(action.phase || '').toUpperCase();
+        const target = action.targetObject || action.target_object || '';
+        const targetText = target ? `，目标=${target}` : '';
+        return `ROS 手臂任务：phase=${phase}${targetText}，超时 ${action.timeoutSec || 120}s`;
       }
       return '预留动作模块';
     }
@@ -2723,10 +2942,17 @@ HTML = r"""<!doctype html>
     }
 
     function updateActionBuilderVisibility() {
-      const isNav = document.getElementById('newActionType').value === 'navigate';
+      const type = document.getElementById('newActionType').value;
+      const isNav = type === 'navigate';
+      const isArm = type.startsWith('arm_');
+      const isArmPick = type === 'arm_pick';
       document.querySelectorAll('.nav-action-field').forEach(el => {
         el.style.display = isNav ? 'grid' : 'none';
       });
+      document.querySelectorAll('.arm-action-field').forEach(el => {
+        el.style.display = isArm ? 'grid' : 'none';
+      });
+      document.getElementById('newArmTargetObject').disabled = !isArmPick;
       document.getElementById('fillCurrentPoseBtn').style.display = isNav ? '' : 'none';
     }
 
@@ -2758,6 +2984,35 @@ HTML = r"""<!doctype html>
         });
         const sourceText = selectedPoint ? `（点位库：${escapeHtml(selectedPoint.name || 'Point')}）` : '';
         showNavMessage('', `动作链：已增加导航动作${sourceText} x=${x.toFixed(3)}, y=${y.toFixed(3)}`);
+        return;
+      }
+      if (type.startsWith('arm_')) {
+        const phaseMap = { arm_pick: 'PICK', arm_place: 'PLACE', arm_reset: 'RESET' };
+        const phase = phaseMap[type];
+        const targetObject = phase === 'PICK' ? document.getElementById('newArmTargetObject').value : '';
+        const timeoutSec = Number(document.getElementById('newArmTimeoutSec').value || 120);
+        if (!phase) {
+          showNavMessage('bad', '动作链：<strong>未知机械臂任务类型</strong>');
+          return;
+        }
+        if (phase === 'PICK' && !targetObject) {
+          showNavMessage('bad', '动作链：<strong>机械臂抓取需要选择目标标签</strong>');
+          return;
+        }
+        if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) {
+          showNavMessage('bad', '动作链：<strong>机械臂任务需要有效超时时间</strong>');
+          return;
+        }
+        const action = {
+          id: makeActionId('arm'),
+          type: 'arm_task',
+          phase,
+          targetObject,
+          timeoutSec: Math.max(1, Math.min(600, Number(timeoutSec.toFixed(1))))
+        };
+        action.title = armActionTitle(action);
+        addWorkflowAction(action);
+        showNavMessage('', `动作链：已增加“${escapeHtml(action.title)}”`);
         return;
       }
       addWorkflowAction({
@@ -2896,19 +3151,38 @@ HTML = r"""<!doctype html>
             workflowRun.completed[action.id] = true;
             continue;
           }
-          if (action.type === 'fake_pick_xiongmao') {
-          workflowRun.actionStartedAt = Date.now();
-            workflowRun.actionDurationSec = action.durationSec || 5;
-          renderWorkflow();
-            showNavMessage('', `动作链：正在执行第 ${index + 1} 步“拾取熊猫烟”（${workflowRun.actionDurationSec} 秒）...`);
-          const actionData = await postJson('/api/actions/execute', {
-            type: 'fake_pick_xiongmao',
-            name: '拾取熊猫烟',
-              duration_sec: workflowRun.actionDurationSec
-          });
-          if (!actionData.ok) {
-            throw new Error(actionData.error || '假动作执行失败');
+          if (action.type === 'arm_task') {
+            workflowRun.actionStartedAt = Date.now();
+            workflowRun.actionDurationSec = action.timeoutSec || 120;
+            renderWorkflow();
+            showNavMessage('', `动作链：正在执行第 ${index + 1} 步“${escapeHtml(action.title || armActionTitle(action))}”...`);
+            const actionData = await postJson('/api/actions/execute', {
+              type: 'arm_task',
+              phase: action.phase,
+              target_object: action.targetObject || '',
+              timeout_sec: workflowRun.actionDurationSec,
+              name: action.title || armActionTitle(action)
+            });
+            if (!actionData.ok) {
+              const statusText = actionData.final_status?.status_text || actionData.last_status?.status_text || '';
+              throw new Error(actionData.error || statusText || '机械臂任务执行失败');
+            }
+            workflowRun.completed[action.id] = true;
+            continue;
           }
+          if (action.type === 'fake_pick_xiongmao') {
+            workflowRun.actionStartedAt = Date.now();
+            workflowRun.actionDurationSec = action.durationSec || 5;
+            renderWorkflow();
+            showNavMessage('', `动作链：正在执行第 ${index + 1} 步“拾取熊猫烟”（${workflowRun.actionDurationSec} 秒）...`);
+            const actionData = await postJson('/api/actions/execute', {
+              type: 'fake_pick_xiongmao',
+              name: '拾取熊猫烟',
+              duration_sec: workflowRun.actionDurationSec
+            });
+            if (!actionData.ok) {
+              throw new Error(actionData.error || '假动作执行失败');
+            }
             workflowRun.completed[action.id] = true;
             continue;
           }
@@ -3099,6 +3373,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "has_point_cloud": snap["point_cloud"] is not None,
                     "has_global_plan_path": snap["navigation"]["global_plan_path"] is not None,
                     "has_robot_basic_state": snap["navigation"]["robot_basic_state"] is not None,
+                    "has_arm_task_status": snap["arm_control"]["last_status"] is not None,
                 }
             )
         else:
@@ -3138,10 +3413,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def execute_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         action_type = str(payload.get("type") or payload.get("action") or "").strip()
+        if action_type in ("arm_task", "arm_pick", "arm_place", "arm_reset"):
+            arm_payload = dict(payload)
+            if action_type == "arm_pick":
+                arm_payload["phase"] = "PICK"
+            elif action_type == "arm_place":
+                arm_payload["phase"] = "PLACE"
+            elif action_type == "arm_reset":
+                arm_payload["phase"] = "RESET"
+            return self.node_ref.execute_arm_task(arm_payload)
         if action_type != "fake_pick_xiongmao":
             return {
                 "ok": False,
-                "error": "unsupported action type; only fake_pick_xiongmao is implemented",
+                "error": "unsupported action type; expected arm_task or fake_pick_xiongmao",
                 "received": payload,
             }
         duration = finite_or_none(payload.get("duration_sec", 5), 3)
@@ -3210,6 +3494,9 @@ def main() -> int:
     parser.add_argument("--global-plan-path-topic", default="/slamware_ros_sdk_server_node/global_plan_path")
     parser.add_argument("--robot-basic-state-topic", default="/slamware_ros_sdk_server_node/robot_basic_state")
     parser.add_argument("--slamware-state-topic", default="/slamware_ros_sdk_server_node/state")
+    parser.add_argument("--arm-command-topic", default="/arm_control/task_command")
+    parser.add_argument("--arm-status-topic", default="/arm_control/task_status")
+    parser.add_argument("--arm-task-timeout-sec", type=float, default=120.0)
     parser.add_argument("--points-file", default="data/nav_points.json")
     parser.add_argument(
         "--min-localization-quality",
@@ -3236,6 +3523,9 @@ def main() -> int:
         global_plan_path_topic=args.global_plan_path_topic,
         robot_basic_state_topic=args.robot_basic_state_topic,
         slamware_state_topic=args.slamware_state_topic,
+        arm_command_topic=args.arm_command_topic,
+        arm_status_topic=args.arm_status_topic,
+        arm_task_timeout_sec=args.arm_task_timeout_sec,
         min_localization_quality=args.min_localization_quality,
         max_cloud_points=args.max_cloud_points,
     )

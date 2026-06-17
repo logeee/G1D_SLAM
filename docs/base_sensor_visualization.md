@@ -217,19 +217,44 @@ curl -s -X POST http://127.0.0.1:18083/api/points/delete \
 
 `SLAM Map + Odometry` 右侧是动作链面板：
 
-- 点击 `增加动作` 可以把动作加入链表；动作类型当前有 `导航` 和 `拾取熊猫烟`。
+- 点击 `增加动作` 可以把动作加入链表；动作类型当前有 `导航`、`机械臂抓取`、`机械臂放置`、`机械臂复位`。
 - `导航` 动作可以直接选择点位库里的点位，自动填入 `x/y/yaw_deg`；也可以手动填写，或直接在地图上点击快速增加导航动作。
+- `机械臂抓取` 会选择目标标签并发布 ROS JSON 到 `/arm_control/task_command`，目前目标标签为 `XiongMao` 和 `Xizi_Liqun`。
+- `机械臂放置` / `机械臂复位` 会发布 `PLACE` / `RESET`，`target_object` 留空。
 - 动作卡片可以拖拽排序，也可以单独删除。
 - `执行动作链` 会按卡片顺序逐个执行：导航动作先到位，其他动作再执行。
 - `仅执行导航` 只用于调试导航，会跳过非导航动作。
-- `拾取熊猫烟` 目前是假动作，后端会休眠 5 秒后返回成功。
+- 机械臂任务会等待 `/arm_control/task_status` 中同一个 `task_id` 的终态：`DONE` 成功，`FAILED` / `REJECTED` 失败，默认超时 120 秒。
 
-假动作接口：
+机械臂任务接口：
 
 ```bash
 curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
   -H 'Content-Type: application/json' \
-  -d '{"type":"fake_pick_xiongmao","name":"拾取熊猫烟","duration_sec":5}'
+  -d '{"type":"arm_task","phase":"PICK","target_object":"XiongMao","timeout_sec":120}'
+
+curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"arm_task","phase":"PLACE","target_object":"","timeout_sec":120}'
+
+curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"arm_task","phase":"RESET","target_object":"","timeout_sec":120}'
 ```
 
-后续接机械臂时，可以保留同一个动作链 UI，把 `fake_pick_xiongmao` 替换成真实动作类型，或者在 `/api/actions/execute` 里根据 `type` 分发到机械臂 SDK。
+只验证 JSON 不发布给机械臂时，可以加 `dry_run:true`：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"arm_task","phase":"PICK","target_object":"Xizi_Liqun","dry_run":true}'
+```
+
+机械臂模块 v2.0 的 ROS Topic 约定：
+
+- 指令 Topic：`/arm_control/task_command`
+- 状态 Topic：`/arm_control/task_status`
+- 消息类型：`std_msgs/String`
+- 指令 JSON 核心字段：`task_id` / `phase` / `target_object`
+- `phase` 取值：`RESET` / `PICK` / `PLACE`
+- `target_object`：`PICK` 必填，必须与 YOLO 标签对应；`PLACE` / `RESET` 留空

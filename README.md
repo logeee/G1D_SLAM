@@ -152,12 +152,14 @@ curl -s -X POST http://127.0.0.1:18083/api/navigation/cancel -d '{}'
 
 `SLAM Map + Odometry` 右侧会显示当前动作链：
 
-- 点击 `增加动作` 可以把动作加入链表；动作类型当前有 `导航` 和 `拾取熊猫烟`。
+- 点击 `增加动作` 可以把动作加入链表；动作类型当前有 `导航`、`机械臂抓取`、`机械臂放置`、`机械臂复位`。
 - `导航` 动作可以直接选择点位库里的点位，自动填入 `x/y/yaw_deg`；也可以手动输入，或直接在地图上点击快速增加导航动作。
+- `机械臂抓取` 会选择目标标签并发布 ROS JSON 到 `/arm_control/task_command`，目前目标标签为 `XiongMao` 和 `Xizi_Liqun`。
+- `机械臂放置` / `机械臂复位` 会发布 `PLACE` / `RESET`，`target_object` 留空。
 - 动作卡片支持拖拽排序，也可以单独删除。
 - `执行动作链` 会按卡片顺序逐个执行：导航动作先到位，其他动作再执行。
 - `仅执行导航` 只用于调试导航，会跳过非导航动作。
-- `拾取熊猫烟` 是假动作，后端会休眠 5 秒再返回。
+- 机械臂任务会等待 `/arm_control/task_status` 中同一个 `task_id` 的终态：`DONE` 成功，`FAILED` / `REJECTED` 失败，默认超时 120 秒。
 
 点位 API：
 
@@ -173,10 +175,35 @@ curl -s -X POST http://127.0.0.1:18083/api/points/upsert \
   -d '{"name":"手动点","x":1.2,"y":0.8,"yaw_deg":90,"actions":[]}'
 ```
 
-假动作 API：
+机械臂任务 API：
 
 ```bash
 curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
   -H 'Content-Type: application/json' \
-  -d '{"type":"fake_pick_xiongmao","name":"拾取熊猫烟","duration_sec":5}'
+  -d '{"type":"arm_task","phase":"PICK","target_object":"XiongMao","timeout_sec":120}'
+
+curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"arm_task","phase":"PLACE","target_object":"","timeout_sec":120}'
+
+curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"arm_task","phase":"RESET","target_object":"","timeout_sec":120}'
 ```
+
+只验证不发布给机械臂时，加 `dry_run:true`：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"arm_task","phase":"PICK","target_object":"Xizi_Liqun","dry_run":true}'
+```
+
+对应机械臂模块文档 v2.0：
+
+- 指令 Topic：`/arm_control/task_command`
+- 状态 Topic：`/arm_control/task_status`
+- 消息类型：`std_msgs/String`
+- 指令 JSON 核心字段：`task_id` / `phase` / `target_object`
+- `phase` 取值：`RESET` / `PICK` / `PLACE`
+- `target_object`：`PICK` 必填，必须与 YOLO 标签对应；`PLACE` / `RESET` 留空
