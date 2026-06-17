@@ -1,11 +1,14 @@
 # 底盘传感器可视化面板
 
-这个面板用于在 149 机器人上只读查看底盘传感器：
+这个面板用于在 149 机器人上查看底盘传感器，并在 SLAM 地图上点选航点后调用思岚/Slamware 底层导航：
 
 - 激光雷达 `/slamware_ros_sdk_server_node/scan`
 - SLAM 地图 `/slamware_ros_sdk_server_node/map`
 - 里程计 `/slamware_ros_sdk_server_node/odom`
 - 超声波/碰撞基础传感器 `/slamware_ros_sdk_server_node/basic_sensors_values`
+- Slamware 规划路径 `/slamware_ros_sdk_server_node/global_plan_path`
+- Slamware 导航请求 `/slamware_ros_sdk_server_node/move_to_locations`
+- Slamware 停止请求 `/slamware_ros_sdk_server_node/cancel_action`
 
 服务默认监听 `0.0.0.0:18083`。机器人和本地电脑在同一网络时，可以直接通过机器人 IP 访问。
 
@@ -70,11 +73,24 @@ http://127.0.0.1:18083/
 
 ## 页面内容
 
-- `SLAM Map + Odometry`：显示 5cm/像素的占据栅格地图、机器人当前位置和轨迹。
+- `SLAM Map + Odometry`：显示 5cm/像素的占据栅格地图、机器人当前位置和轨迹，也可以点击地图添加航点。
 - `Laser Scan`：显示激光雷达 2D 扫描点、最小距离、有效点数量。
 - `Ultrasonic / Bumper Sensors`：显示两个 SONAR 和两个 BUMPER 的 id、安装位置、触发状态和值。
 - `3D Point Cloud`：显示 `PointCloud2` 点云。当前默认 topic 是 `/ele_clouds`，这是底盘处理后的稀疏点云，不是深度相机原始稠密点云。
 - `Raw State`：显示当前 API 状态摘要。
+
+### 地图选点导航
+
+在 `SLAM Map + Odometry` 地图上点击即可添加航点：
+
+- 紫色点/虚线：网页手动选择的航点和直连预览。
+- 橙色线：Slamware 底层发布的 `global_plan_path`。
+- `撤销点`：删除最后一个航点。
+- `清空点`：删除所有航点。
+- `开始导航`：将航点发送到 `/slamware_ros_sdk_server_node/move_to_locations`。
+- `停止导航`：发送 `/slamware_ros_sdk_server_node/cancel_action`。
+
+开始导航前，服务会检查地图、里程计、激光、超声/碰撞传感器是否新鲜，并检查航点是否在地图内、是否落在占用栅格上。碰撞/超声触发时不会启动导航。当前 `localization_quality=0` 默认只提示警告；如需强制限制，可以启动时增加 `--min-localization-quality N`。
 
 `3D Point Cloud` 面板可以用鼠标拖拽旋转视角。右侧读数里：
 
@@ -95,6 +111,20 @@ curl -s http://127.0.0.1:18083/api/health
 
 ```bash
 curl -s http://127.0.0.1:18083/api/state
+```
+
+开始导航：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/navigation/start \
+  -H 'Content-Type: application/json' \
+  -d '{"waypoints":[{"x":1.0,"y":2.0},{"x":1.5,"y":2.5}]}'
+```
+
+停止导航：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/navigation/cancel -d '{}'
 ```
 
 如果要临时改点云来源，可以手动启动时指定：

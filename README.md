@@ -1,6 +1,6 @@
 # 思岚底盘传感器可视化
 
-这是一个独立的小服务，用于只读查看 Unitree G1D 机器人底盘侧的思岚/SLAMWARE 传感器数据。
+这是一个独立的小服务，用于查看 Unitree G1D 机器人底盘侧的思岚/SLAMWARE 传感器数据，并在 SLAM 地图上点选航点后交给 Slamware 底层导航。
 
 当前支持：
 
@@ -9,6 +9,7 @@
 - 超声波/碰撞传感器
 - `/ele_clouds` 稀疏点云
 - 当前 ROS 状态摘要
+- 地图点选航点、路径预览、开始/停止 Slamware 导航
 
 服务默认监听 `0.0.0.0:18083`，机器人和本地电脑在同一网络时，可以直接通过机器人 IP 打开网页。
 
@@ -32,6 +33,17 @@ curl -s http://127.0.0.1:18083/api/health
 ```text
 http://192.168.0.149:18083/
 ```
+
+## 地图选点导航
+
+打开页面后，在 `SLAM Map + Odometry` 地图上点击添加航点：
+
+- 紫色点/虚线：网页里手动选择的航点和直连预览。
+- 橙色线：Slamware 底层返回的 `global_plan_path`，也就是真实规划路径。
+- `开始导航`：把当前航点发布到 `/slamware_ros_sdk_server_node/move_to_locations`。
+- `停止导航`：发布 `/slamware_ros_sdk_server_node/cancel_action`。
+
+开始导航前会做基础安全检查：地图、里程计、激光、超声/碰撞传感器需要新鲜；航点不能落在地图外或占用栅格上；碰撞/超声触发时不允许启动。当前 `localization_quality=0` 会显示警告，但默认不拦截，可用 `--min-localization-quality` 改成强制拦截。
 
 ## 开机启动
 
@@ -83,3 +95,19 @@ docs/base_sensor_visualization.md      中文使用说明
 详细说明见：
 
 - `docs/base_sensor_visualization.md`
+
+## 导航 API
+
+开始导航：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/navigation/start \
+  -H 'Content-Type: application/json' \
+  -d '{"waypoints":[{"x":1.0,"y":2.0},{"x":1.5,"y":2.5}]}'
+```
+
+停止导航：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/navigation/cancel -d '{}'
+```

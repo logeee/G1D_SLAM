@@ -18,15 +18,22 @@ import time
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import rclpy
-from nav_msgs.msg import OccupancyGrid, Odometry
+from geometry_msgs.msg import Point
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan, PointCloud2
-from slamware_ros_sdk.msg import BasicSensorValueDataArray
+from slamware_ros_sdk.msg import (
+    BasicSensorValueDataArray,
+    CancelActionRequest,
+    MoveToLocationsRequest,
+    RobotBasicState,
+)
+from std_msgs.msg import String
 
 
 SENSOR_TYPE_NAMES = {
@@ -80,8 +87,22 @@ class SharedState:
         self.odom: Optional[Dict[str, Any]] = None
         self.sensors: Optional[Dict[str, Any]] = None
         self.point_cloud: Optional[Dict[str, Any]] = None
+        self.global_plan_path: Optional[Dict[str, Any]] = None
+        self.robot_basic_state: Optional[Dict[str, Any]] = None
+        self.slamware_state: Optional[Dict[str, Any]] = None
+        self.last_navigation_command: Optional[Dict[str, Any]] = None
         self.track: deque[Dict[str, float]] = deque(maxlen=max_track)
-        self.seq = {"scan": 0, "map": 0, "odom": 0, "sensors": 0, "point_cloud": 0}
+        self.seq = {
+            "scan": 0,
+            "map": 0,
+            "odom": 0,
+            "sensors": 0,
+            "point_cloud": 0,
+            "global_plan_path": 0,
+            "robot_basic_state": 0,
+            "slamware_state": 0,
+            "navigation_command": 0,
+        }
 
     def snapshot(self) -> Dict[str, Any]:
         now = time.time()
@@ -97,12 +118,21 @@ class SharedState:
                 "track": list(self.track),
                 "sensors": self.sensors,
                 "point_cloud": self.point_cloud,
+                "navigation": {
+                    "global_plan_path": self.global_plan_path,
+                    "robot_basic_state": self.robot_basic_state,
+                    "slamware_state": self.slamware_state,
+                    "last_command": self.last_navigation_command,
+                },
                 "freshness_s": {
                     "scan": self._age(self.scan, now),
                     "map": self._age(self.map, now),
                     "odom": self._age(self.odom, now),
                     "sensors": self._age(self.sensors, now),
                     "point_cloud": self._age(self.point_cloud, now),
+                    "global_plan_path": self._age(self.global_plan_path, now),
+                    "robot_basic_state": self._age(self.robot_basic_state, now),
+                    "slamware_state": self._age(self.slamware_state, now),
                 },
             }
 
@@ -125,11 +155,18 @@ class BaseSensorNode(Node):
         odom_topics: Iterable[str],
         sensors_topic: str,
         pointcloud_topics: Iterable[str],
+        move_to_locations_topic: str,
+        cancel_action_topic: str,
+        global_plan_path_topic: str,
+        robot_basic_state_topic: str,
+        slamware_state_topic: str,
+        min_localization_quality: int,
         max_cloud_points: int,
     ) -> None:
         super().__init__("base_sensor_visual_server")
         self.state = state
         self.max_cloud_points = max(10, int(max_cloud_points))
+        self.min_localization_quality = int(min_localization_quality)
         qos = make_reliable_qos(depth=10)
         self.create_subscription(LaserScan, scan_topic, self.on_scan, qos)
         self.create_subscription(OccupancyGrid, map_topic, self.on_map, qos)
@@ -137,12 +174,17 @@ class BaseSensorNode(Node):
             if topic:
                 self.create_subscription(Odometry, topic, self.make_odom_cb(topic), qos)
         self.create_subscription(BasicSensorValueDataArray, sensors_topic, self.on_sensors, qos)
+        self.create_subscription(Path, global_plan_path_topic, self.on_global_plan_path, qos)
+        self.create_subscription(RobotBasicState, robot_basic_state_topic, self.on_robot_basic_state, qos)
+        self.create_subscription(String, slamware_state_topic, self.on_slamware_state, qos)
         pointcloud_topics = [topic for topic in pointcloud_topics if topic]
         for topic in pointcloud_topics:
             self.create_subscription(PointCloud2, topic, self.make_point_cloud_cb(topic), qos)
+        self.move_to_locations_pub = self.create_publisher(MoveToLocationsRequest, move_to_locations_topic, qos)
+        self.cancel_action_pub = self.create_publisher(CancelActionRequest, cancel_action_topic, qos)
         self.get_logger().info(
             f"subscribed scan={scan_topic} map={map_topic} sensors={sensors_topic} "
-            f"pointclouds={pointcloud_topics}"
+            f"pointclouds={pointcloud_topics} plan={global_plan_path_topic}"
         )
 
     def on_scan(self, msg: LaserScan) -> None:
@@ -274,6 +316,318 @@ class BaseSensorNode(Node):
             self.state.seq["sensors"] += 1
             payload["seq"] = self.state.seq["sensors"]
             self.state.sensors = payload
+
+    def on_global_plan_path(self, msg: Path) -> None:
+        now = time.time()
+        poses = []
+        max_points = 2500
+        step = max(1, math.ceil(len(msg.poses) / max_points)) if msg.poses else 1
+        for stamped in msg.poses[::step]:
+            p = stamped.pose.position
+            q = stamped.pose.orientation
+            poses.append(
+                {
+                    "x": finite_or_none(p.x, 5),
+                    "y": finite_or_none(p.y, 5),
+                    "z": finite_or_none(p.z, 5),
+                    "yaw": finite_or_none(yaw_from_quaternion(q.x, q.y, q.z, q.w), 6),
+                }
+            )
+        payload = {
+            "received_at": now,
+            "frame_id": msg.header.frame_id,
+            "stamp": {"sec": int(msg.header.stamp.sec), "nanosec": int(msg.header.stamp.nanosec)},
+            "total_poses": len(msg.poses),
+            "sampled_poses": len(poses),
+            "poses": poses,
+        }
+        with self.state.lock:
+            self.state.seq["global_plan_path"] += 1
+            payload["seq"] = self.state.seq["global_plan_path"]
+            self.state.global_plan_path = payload
+
+    def on_robot_basic_state(self, msg: RobotBasicState) -> None:
+        now = time.time()
+        payload = {
+            "received_at": now,
+            "is_map_building_enabled": bool(msg.is_map_building_enabled),
+            "is_localization_enabled": bool(msg.is_localization_enabled),
+            "localization_quality": int(msg.localization_quality),
+            "board_temperature": int(msg.board_temperature),
+            "battery_percentage": int(msg.battery_percentage),
+            "is_dc_in": bool(msg.is_dc_in),
+            "is_charging": bool(msg.is_charging),
+        }
+        with self.state.lock:
+            self.state.seq["robot_basic_state"] += 1
+            payload["seq"] = self.state.seq["robot_basic_state"]
+            self.state.robot_basic_state = payload
+
+    def on_slamware_state(self, msg: String) -> None:
+        now = time.time()
+        payload = {"received_at": now, "state": str(msg.data)}
+        with self.state.lock:
+            self.state.seq["slamware_state"] += 1
+            payload["seq"] = self.state.seq["slamware_state"]
+            self.state.slamware_state = payload
+
+    def start_navigation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        waypoints, parse_errors = self.parse_waypoints(payload.get("waypoints", payload.get("points", [])))
+        if parse_errors:
+            return {"ok": False, "error": "invalid waypoints", "errors": parse_errors}
+        if not waypoints:
+            return {"ok": False, "error": "no waypoints selected"}
+        if len(waypoints) > 60:
+            return {"ok": False, "error": "too many waypoints", "max_waypoints": 60}
+
+        safety = self.check_navigation_safety(waypoints)
+        if safety["blockers"]:
+            return {"ok": False, "error": "navigation safety check failed", "safety": safety}
+
+        request = MoveToLocationsRequest()
+        request.locations = [Point(x=p["x"], y=p["y"], z=0.0) for p in waypoints]
+        yaw = payload.get("yaw")
+        if yaw is None:
+            yaw = self.infer_final_yaw(waypoints)
+        try:
+            request.yaw = float(yaw)
+        except (TypeError, ValueError):
+            request.yaw = 0.0
+
+        speed_ratio = payload.get("speed_ratio")
+        if speed_ratio is not None:
+            try:
+                speed = max(0.05, min(1.0, float(speed_ratio)))
+                request.options.speed_ratio.is_valid = True
+                request.options.speed_ratio.value = speed
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid speed_ratio"}
+
+        self.move_to_locations_pub.publish(request)
+        now = time.time()
+        command = {
+            "received_at": now,
+            "type": "move_to_locations",
+            "waypoints": waypoints,
+            "yaw": finite_or_none(request.yaw, 5),
+            "yaw_deg": finite_or_none(math.degrees(float(request.yaw)), 2),
+            "speed_ratio": finite_or_none(request.options.speed_ratio.value, 3)
+            if request.options.speed_ratio.is_valid
+            else None,
+            "published_topic": "/slamware_ros_sdk_server_node/move_to_locations",
+            "safety": safety,
+        }
+        with self.state.lock:
+            self.state.seq["navigation_command"] += 1
+            command["seq"] = self.state.seq["navigation_command"]
+            self.state.last_navigation_command = command
+        return {"ok": True, "navigation_started": True, "command": command}
+
+    def cancel_navigation(self) -> Dict[str, Any]:
+        self.cancel_action_pub.publish(CancelActionRequest())
+        now = time.time()
+        command = {
+            "received_at": now,
+            "type": "cancel_action",
+            "published_topic": "/slamware_ros_sdk_server_node/cancel_action",
+        }
+        with self.state.lock:
+            self.state.seq["navigation_command"] += 1
+            command["seq"] = self.state.seq["navigation_command"]
+            self.state.last_navigation_command = command
+        return {"ok": True, "navigation_cancelled": True, "command": command}
+
+    def parse_waypoints(self, raw: Any) -> Tuple[List[Dict[str, float]], List[str]]:
+        errors = []
+        points = []
+        if not isinstance(raw, list):
+            return [], ["waypoints must be a list"]
+        for idx, item in enumerate(raw):
+            if isinstance(item, dict):
+                x_raw = item.get("x")
+                y_raw = item.get("y")
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                x_raw, y_raw = item[0], item[1]
+            else:
+                errors.append(f"waypoint {idx + 1} must have x/y")
+                continue
+            try:
+                x = float(x_raw)
+                y = float(y_raw)
+            except (TypeError, ValueError):
+                errors.append(f"waypoint {idx + 1} x/y must be numbers")
+                continue
+            if not (math.isfinite(x) and math.isfinite(y)):
+                errors.append(f"waypoint {idx + 1} x/y must be finite")
+                continue
+            points.append({"x": round(x, 4), "y": round(y, 4)})
+        return points, errors
+
+    def infer_final_yaw(self, waypoints: List[Dict[str, float]]) -> float:
+        if len(waypoints) >= 2:
+            a = waypoints[-2]
+            b = waypoints[-1]
+            return math.atan2(b["y"] - a["y"], b["x"] - a["x"])
+        with self.state.lock:
+            odom = self.state.odom
+        if odom and odom.get("yaw") is not None:
+            return float(odom["yaw"])
+        return 0.0
+
+    def check_navigation_safety(self, waypoints: List[Dict[str, float]]) -> Dict[str, Any]:
+        now = time.time()
+        blockers: List[str] = []
+        warnings: List[str] = []
+        waypoint_checks = []
+
+        with self.state.lock:
+            map_payload = self.state.map
+            odom = self.state.odom
+            scan = self.state.scan
+            sensors = self.state.sensors
+            robot_basic_state = self.state.robot_basic_state
+            slamware_state = self.state.slamware_state
+
+        self.require_fresh("map", map_payload, now, 3.0, blockers)
+        self.require_fresh("odom", odom, now, 1.0, blockers)
+        self.require_fresh("scan", scan, now, 1.5, blockers)
+        self.require_fresh("basic sensors", sensors, now, 3.0, blockers)
+        self.require_fresh("robot basic state", robot_basic_state, now, 3.0, warnings)
+
+        if sensors:
+            hit_sensors = [item for item in sensors.get("items", []) if item.get("is_in_impact")]
+            if hit_sensors:
+                ids = ", ".join(str(item.get("id")) for item in hit_sensors)
+                blockers.append(f"bumper/sonar impact active: {ids}")
+
+        if robot_basic_state:
+            if not robot_basic_state.get("is_localization_enabled"):
+                blockers.append("slamware localization is disabled")
+            quality = robot_basic_state.get("localization_quality")
+            if quality is not None and quality <= 0:
+                msg = f"localization_quality is {quality}; verify localization before moving"
+                if self.min_localization_quality >= 0 and int(quality) < self.min_localization_quality:
+                    blockers.append(msg)
+                else:
+                    warnings.append(msg)
+
+        if slamware_state and str(slamware_state.get("state", "")).lower() not in ("connected", "ok", "running"):
+            warnings.append(f"slamware state is {slamware_state.get('state')}")
+
+        if map_payload:
+            for idx, point in enumerate(waypoints):
+                waypoint_checks.append(self.check_waypoint_on_map(idx, point, map_payload, blockers, warnings))
+            self.check_straight_segments_on_map(waypoints, map_payload, warnings)
+
+        return {
+            "ok": not blockers,
+            "blockers": blockers,
+            "warnings": warnings,
+            "waypoint_checks": waypoint_checks,
+            "min_localization_quality": self.min_localization_quality,
+        }
+
+    @staticmethod
+    def require_fresh(
+        name: str,
+        item: Optional[Dict[str, Any]],
+        now: float,
+        max_age_s: float,
+        output: List[str],
+    ) -> None:
+        if not item:
+            output.append(f"{name} has no data")
+            return
+        stamp = item.get("received_at")
+        if stamp is None:
+            output.append(f"{name} has no timestamp")
+            return
+        age = now - float(stamp)
+        if age > max_age_s:
+            output.append(f"{name} is stale: {age:.2f}s > {max_age_s:.2f}s")
+
+    def check_waypoint_on_map(
+        self,
+        idx: int,
+        point: Dict[str, float],
+        map_payload: Dict[str, Any],
+        blockers: List[str],
+        warnings: List[str],
+    ) -> Dict[str, Any]:
+        cell = self.world_to_map_cell(point["x"], point["y"], map_payload)
+        result = {"index": idx, "x": point["x"], "y": point["y"], "cell": cell, "status": "ok", "value": None}
+        if cell is None:
+            result["status"] = "out_of_map"
+            blockers.append(f"waypoint {idx + 1} is outside map")
+            return result
+        data = map_payload.get("data") or []
+        width = int(map_payload.get("width") or 0)
+        data_idx = cell["y"] * width + cell["x"]
+        value = int(data[data_idx]) if 0 <= data_idx < len(data) else -1
+        result["value"] = value
+        if value > 70:
+            result["status"] = "occupied"
+            blockers.append(f"waypoint {idx + 1} is on occupied map cell: {value}")
+        elif value < 0:
+            result["status"] = "unknown"
+            warnings.append(f"waypoint {idx + 1} is on unknown map cell")
+        return result
+
+    @staticmethod
+    def world_to_map_cell(x: float, y: float, map_payload: Dict[str, Any]) -> Optional[Dict[str, int]]:
+        resolution = float(map_payload.get("resolution") or 0.0)
+        width = int(map_payload.get("width") or 0)
+        height = int(map_payload.get("height") or 0)
+        origin = map_payload.get("origin") or {}
+        if resolution <= 0 or width <= 0 or height <= 0:
+            return None
+        mx = int(math.floor((x - float(origin.get("x") or 0.0)) / resolution))
+        my = int(math.floor((y - float(origin.get("y") or 0.0)) / resolution))
+        if mx < 0 or my < 0 or mx >= width or my >= height:
+            return None
+        return {"x": mx, "y": my}
+
+    def check_straight_segments_on_map(
+        self,
+        waypoints: List[Dict[str, float]],
+        map_payload: Dict[str, Any],
+        warnings: List[str],
+    ) -> None:
+        if len(waypoints) < 2:
+            return
+        data = map_payload.get("data") or []
+        width = int(map_payload.get("width") or 0)
+        resolution = float(map_payload.get("resolution") or 0.0)
+        if not data or width <= 0 or resolution <= 0:
+            return
+        for idx in range(len(waypoints) - 1):
+            a = waypoints[idx]
+            b = waypoints[idx + 1]
+            dist = math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+            steps = max(2, int(math.ceil(dist / resolution)))
+            occupied = 0
+            unknown = 0
+            for step in range(steps + 1):
+                t = step / steps
+                x = a["x"] + (b["x"] - a["x"]) * t
+                y = a["y"] + (b["y"] - a["y"]) * t
+                cell = self.world_to_map_cell(x, y, map_payload)
+                if cell is None:
+                    unknown += 1
+                    continue
+                data_idx = cell["y"] * width + cell["x"]
+                value = int(data[data_idx]) if 0 <= data_idx < len(data) else -1
+                if value > 70:
+                    occupied += 1
+                elif value < 0:
+                    unknown += 1
+            if occupied:
+                warnings.append(
+                    f"straight preview segment {idx + 1}->{idx + 2} crosses {occupied} occupied cells; "
+                    "Slamware may plan around them"
+                )
+            elif unknown:
+                warnings.append(f"straight preview segment {idx + 1}->{idx + 2} crosses unknown cells")
 
     def make_point_cloud_cb(self, topic: str):
         def on_point_cloud(msg: PointCloud2) -> None:
@@ -426,6 +780,7 @@ HTML = r"""<!doctype html>
       aspect-ratio: 1 / 1;
     }
     #mapCanvas { aspect-ratio: 1.45 / 1; }
+    #mapCanvas { cursor: crosshair; }
     #cloudCanvas { aspect-ratio: 1.45 / 1; cursor: grab; }
     #cloudCanvas:active { cursor: grabbing; }
     .sensor-grid {
@@ -463,6 +818,49 @@ HTML = r"""<!doctype html>
       padding: 10px;
       border-top: 1px solid var(--line);
     }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      padding: 0 10px 10px;
+    }
+    button {
+      border: 1px solid #b9c6d8;
+      background: #f8fafc;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.primary {
+      background: #2563eb;
+      border-color: #1d4ed8;
+      color: #fff;
+    }
+    button.danger {
+      background: #fff7f7;
+      border-color: #fecaca;
+      color: #b91c1c;
+    }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+    .nav-hint {
+      color: var(--muted);
+      font-size: 12px;
+      margin-left: auto;
+    }
+    .nav-status {
+      padding: 0 10px 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .nav-status strong { color: var(--text); }
+    .nav-status.warn strong { color: var(--amber); }
+    .nav-status.bad strong { color: var(--warn); }
     .metric {
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -499,11 +897,23 @@ HTML = r"""<!doctype html>
         <span id="mapMeta" class="meta">waiting</span>
       </div>
       <div class="canvas-wrap"><canvas id="mapCanvas"></canvas></div>
+      <div class="toolbar">
+        <button id="undoWaypointBtn">撤销点</button>
+        <button id="clearWaypointsBtn">清空点</button>
+        <button id="startNavigationBtn" class="primary">开始导航</button>
+        <button id="stopNavigationBtn" class="danger">停止导航</button>
+        <span class="nav-hint">在地图上点击添加航点</span>
+      </div>
+      <div id="navStatus" class="nav-status">导航：等待选点</div>
       <div class="readout">
         <div class="metric"><div class="label">X</div><div id="odomX" class="value">--</div></div>
         <div class="metric"><div class="label">Y</div><div id="odomY" class="value">--</div></div>
         <div class="metric"><div class="label">Yaw</div><div id="odomYaw" class="value">--</div></div>
         <div class="metric"><div class="label">Track</div><div id="trackCount" class="value">--</div></div>
+        <div class="metric"><div class="label">航点</div><div id="waypointCount" class="value">0</div></div>
+        <div class="metric"><div class="label">规划路径</div><div id="planCount" class="value">--</div></div>
+        <div class="metric"><div class="label">定位</div><div id="localizationState" class="value">--</div></div>
+        <div class="metric"><div class="label">导航指令</div><div id="navCommand" class="value">--</div></div>
       </div>
     </section>
 
@@ -558,6 +968,9 @@ HTML = r"""<!doctype html>
     const cloudCanvas = document.getElementById('cloudCanvas');
     let cachedMapSeq = -1;
     let cachedMapImage = null;
+    let lastState = null;
+    let currentMapGeom = null;
+    let selectedWaypoints = [];
     let cloudYaw = -0.75;
     let cloudPitch = 0.65;
     let cloudDragging = false;
@@ -592,6 +1005,68 @@ HTML = r"""<!doctype html>
         x: geom.ox + mx * geom.scale,
         y: geom.oy + (map.height - my) * geom.scale
       };
+    }
+
+    function canvasToMap(map, canvasX, canvasY, geom) {
+      if (!map || !geom) return null;
+      const mx = (canvasX - geom.ox) / geom.scale;
+      const my = map.height - ((canvasY - geom.oy) / geom.scale);
+      if (mx < 0 || my < 0 || mx >= map.width || my >= map.height) return null;
+      return {
+        x: map.origin.x + mx * map.resolution,
+        y: map.origin.y + my * map.resolution
+      };
+    }
+
+    function eventToCanvas(canvas, ev) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: (ev.clientX - rect.left) * (canvas.width / rect.width),
+        y: (ev.clientY - rect.top) * (canvas.height / rect.height)
+      };
+    }
+
+    function drawMapPolyline(ctx, map, geom, points, color, width, dashed = false) {
+      if (!points || points.length < 2) return;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width * (window.devicePixelRatio || 1);
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      if (dashed) ctx.setLineDash([10 * (window.devicePixelRatio || 1), 6 * (window.devicePixelRatio || 1)]);
+      ctx.beginPath();
+      points.forEach((p, i) => {
+        const c = mapToCanvas(map, p.x, p.y, geom);
+        if (i === 0) ctx.moveTo(c.x, c.y);
+        else ctx.lineTo(c.x, c.y);
+      });
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawSelectedWaypoints(ctx, map, geom) {
+      drawMapPolyline(ctx, map, geom, selectedWaypoints, '#9333ea', 3, true);
+      const dpr = window.devicePixelRatio || 1;
+      selectedWaypoints.forEach((p, idx) => {
+        const c = mapToCanvas(map, p.x, p.y, geom);
+        ctx.fillStyle = '#9333ea';
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 3 * dpr;
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, 8 * dpr, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `${12 * dpr}px system-ui, sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(idx + 1), c.x, c.y);
+      });
+    }
+
+    function drawGlobalPlan(ctx, map, geom, nav) {
+      const path = nav?.global_plan_path?.poses || [];
+      drawMapPolyline(ctx, map, geom, path, '#d97706', 4, false);
     }
 
     function drawMap(state) {
@@ -638,7 +1113,10 @@ HTML = r"""<!doctype html>
       const dw = map.width * scale;
       const dh = map.height * scale;
       const geom = { scale, ox: (mapCanvas.width - dw) / 2, oy: (mapCanvas.height - dh) / 2 };
+      currentMapGeom = geom;
       ctx.drawImage(cachedMapImage, geom.ox, geom.oy, dw, dh);
+
+      drawGlobalPlan(ctx, map, geom, state.navigation);
 
       if (state.track && state.track.length > 1) {
         ctx.strokeStyle = '#2563eb';
@@ -669,6 +1147,8 @@ HTML = r"""<!doctype html>
         ctx.fill();
         ctx.restore();
       }
+
+      drawSelectedWaypoints(ctx, map, geom);
 
       document.getElementById('mapMeta').textContent =
         `${map.width}x${map.height}, ${fmt(map.resolution, 3, 'm/cell')}`;
@@ -812,6 +1292,16 @@ HTML = r"""<!doctype html>
       document.getElementById('odomY').textContent = fmt(state.odom?.y, 3, 'm');
       document.getElementById('odomYaw').textContent = fmt(state.odom?.yaw_deg, 1, 'deg');
       document.getElementById('trackCount').textContent = state.track ? String(state.track.length) : '--';
+      document.getElementById('waypointCount').textContent = String(selectedWaypoints.length);
+      document.getElementById('planCount').textContent = state.navigation?.global_plan_path
+        ? `${state.navigation.global_plan_path.total_poses}`
+        : '--';
+      const basic = state.navigation?.robot_basic_state;
+      document.getElementById('localizationState').textContent = basic
+        ? `${basic.is_localization_enabled ? 'ON' : 'OFF'} / ${basic.localization_quality}`
+        : '--';
+      const cmd = state.navigation?.last_command;
+      document.getElementById('navCommand').textContent = cmd?.type ? `${cmd.type} #${cmd.seq || ''}` : '--';
       document.getElementById('scanValid').textContent = state.scan ? `${state.scan.valid_count}/${state.scan.count}` : '--';
       document.getElementById('scanMin').textContent = fmt(state.scan?.min_range, 3, 'm');
       document.getElementById('scanFrame').textContent = state.scan?.frame_id || '--';
@@ -826,16 +1316,37 @@ HTML = r"""<!doctype html>
       document.getElementById('cloudAge').textContent = fmt(state.freshness_s?.point_cloud, 2, 's');
     }
 
+    function updateNavigationStatus(state) {
+      const navStatus = document.getElementById('navStatus');
+      const last = state.navigation?.last_command;
+      const basic = state.navigation?.robot_basic_state;
+      const slamState = state.navigation?.slamware_state?.state || '--';
+      const planCount = state.navigation?.global_plan_path?.total_poses || 0;
+      const parts = [
+        `<strong>${selectedWaypoints.length}</strong> 个航点`,
+        `Slamware: <strong>${slamState}</strong>`,
+        `定位: <strong>${basic ? (basic.is_localization_enabled ? 'ON' : 'OFF') + ' / ' + basic.localization_quality : '--'}</strong>`,
+        `规划路径: <strong>${planCount}</strong> 点`
+      ];
+      if (last?.type) parts.push(`上次指令: <strong>${last.type}</strong>`);
+      navStatus.className = 'nav-status';
+      if (basic && !basic.is_localization_enabled) navStatus.classList.add('bad');
+      else if (basic && Number(basic.localization_quality) <= 0) navStatus.classList.add('warn');
+      navStatus.innerHTML = `导航：${parts.join('　')}`;
+    }
+
     async function tick() {
       try {
         const res = await fetch('/api/state', { cache: 'no-store' });
         const state = await res.json();
+        lastState = state;
         setStatus(true, `online, uptime ${fmt(state.uptime_s, 1, 's')}`);
         drawMap(state);
         drawScan(state);
         drawCloud(state);
         renderSensors(state);
         updateReadouts(state);
+        updateNavigationStatus(state);
         document.getElementById('rawState').textContent = JSON.stringify({
           freshness_s: state.freshness_s,
           seq: state.seq,
@@ -849,12 +1360,115 @@ HTML = r"""<!doctype html>
             bounds: state.point_cloud.bounds
           } : null,
           sensors: state.sensors,
-          map: state.map ? { frame_id: state.map.frame_id, width: state.map.width, height: state.map.height, resolution: state.map.resolution, origin: state.map.origin } : null
+          map: state.map ? { frame_id: state.map.frame_id, width: state.map.width, height: state.map.height, resolution: state.map.resolution, origin: state.map.origin } : null,
+          navigation: state.navigation
         }, null, 2);
       } catch (err) {
         setStatus(false, `offline: ${err}`);
       }
     }
+
+    function setNavButtonsBusy(busy) {
+      document.getElementById('startNavigationBtn').disabled = busy;
+      document.getElementById('stopNavigationBtn').disabled = busy;
+      document.getElementById('undoWaypointBtn').disabled = busy;
+      document.getElementById('clearWaypointsBtn').disabled = busy;
+    }
+
+    function showNavMessage(kind, text) {
+      const el = document.getElementById('navStatus');
+      el.className = `nav-status ${kind || ''}`.trim();
+      el.innerHTML = text;
+    }
+
+    async function postJson(url, payload = {}) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        cache: 'no-store'
+      });
+      const text = await res.text();
+      let data;
+      try { data = text ? JSON.parse(text) : {}; }
+      catch (err) { data = { ok: false, error: text || String(err) }; }
+      if (!res.ok) data.ok = false;
+      return data;
+    }
+
+    async function startNavigation() {
+      if (!selectedWaypoints.length) {
+        showNavMessage('bad', '导航：<strong>请先在地图上点击选择至少一个航点</strong>');
+        return;
+      }
+      setNavButtonsBusy(true);
+      showNavMessage('', '导航：正在发送航点给 Slamware...');
+      try {
+        const data = await postJson('/api/navigation/start', { waypoints: selectedWaypoints });
+        if (data.ok) {
+          const warnings = data.command?.safety?.warnings || [];
+          const warningText = warnings.length ? `，警告：${warnings.join('；')}` : '';
+          showNavMessage(warnings.length ? 'warn' : '', `导航：<strong>已开始</strong>，航点 ${selectedWaypoints.length} 个${warningText}`);
+        } else {
+          const blockers = data.safety?.blockers || [];
+          const details = blockers.length ? `：${blockers.join('；')}` : (data.error || 'unknown error');
+          showNavMessage('bad', `导航：<strong>启动失败</strong>${details}`);
+        }
+      } catch (err) {
+        showNavMessage('bad', `导航：<strong>请求失败</strong> ${err}`);
+      } finally {
+        setNavButtonsBusy(false);
+        tick();
+      }
+    }
+
+    async function stopNavigation() {
+      setNavButtonsBusy(true);
+      showNavMessage('', '导航：正在发送停止指令...');
+      try {
+        const data = await postJson('/api/navigation/cancel', {});
+        if (data.ok) showNavMessage('', '导航：<strong>已发送停止指令</strong>');
+        else showNavMessage('bad', `导航：<strong>停止失败</strong> ${data.error || ''}`);
+      } catch (err) {
+        showNavMessage('bad', `导航：<strong>停止请求失败</strong> ${err}`);
+      } finally {
+        setNavButtonsBusy(false);
+        tick();
+      }
+    }
+
+    mapCanvas.addEventListener('click', ev => {
+      if (!lastState?.map || !currentMapGeom) return;
+      const c = eventToCanvas(mapCanvas, ev);
+      const p = canvasToMap(lastState.map, c.x, c.y, currentMapGeom);
+      if (!p) {
+        showNavMessage('bad', '导航：<strong>点在地图外</strong>');
+        return;
+      }
+      selectedWaypoints.push({ x: Number(p.x.toFixed(4)), y: Number(p.y.toFixed(4)) });
+      drawMap(lastState);
+      updateReadouts(lastState);
+      updateNavigationStatus(lastState);
+    });
+
+    document.getElementById('undoWaypointBtn').addEventListener('click', () => {
+      selectedWaypoints.pop();
+      if (lastState) {
+        drawMap(lastState);
+        updateReadouts(lastState);
+        updateNavigationStatus(lastState);
+      }
+    });
+    document.getElementById('clearWaypointsBtn').addEventListener('click', () => {
+      selectedWaypoints = [];
+      if (lastState) {
+        drawMap(lastState);
+        updateReadouts(lastState);
+        updateNavigationStatus(lastState);
+      }
+    });
+    document.getElementById('startNavigationBtn').addEventListener('click', startNavigation);
+    document.getElementById('stopNavigationBtn').addEventListener('click', stopNavigation);
 
     cloudCanvas.addEventListener('pointerdown', ev => {
       cloudDragging = true;
@@ -883,6 +1497,7 @@ HTML = r"""<!doctype html>
 
 class DashboardHandler(BaseHTTPRequestHandler):
     state: SharedState
+    node_ref: BaseSensorNode
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
@@ -906,10 +1521,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "has_odom": snap["odom"] is not None,
                     "has_sensors": snap["sensors"] is not None,
                     "has_point_cloud": snap["point_cloud"] is not None,
+                    "has_global_plan_path": snap["navigation"]["global_plan_path"] is not None,
+                    "has_robot_basic_state": snap["navigation"]["robot_basic_state"] is not None,
                 }
             )
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path in ("/api/navigation/start", "/api/nav/start"):
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.start_navigation(payload))
+        elif parsed.path in ("/api/navigation/cancel", "/api/nav/cancel", "/api/navigation/stop", "/api/nav/stop"):
+            self.write_json(self.node_ref.cancel_navigation())
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND, "not found")
+
+    def read_json_body(self) -> Optional[Dict[str, Any]]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(HTTPStatus.BAD_REQUEST, "invalid content length")
+            return None
+        if length <= 0:
+            return {}
+        if length > 65536:
+            self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body too large")
+            return None
+        raw = self.rfile.read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self.send_error(HTTPStatus.BAD_REQUEST, f"invalid json: {exc}")
+            return None
+        if not isinstance(payload, dict):
+            self.send_error(HTTPStatus.BAD_REQUEST, "json body must be an object")
+            return None
+        return payload
 
     def write_json(self, obj: Dict[str, Any]) -> None:
         data = json.dumps(obj, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
@@ -933,6 +1584,17 @@ def main() -> int:
     parser.add_argument("--odom-topic", action="append", default=["/slamware_ros_sdk_server_node/odom"])
     parser.add_argument("--sensors-topic", default="/slamware_ros_sdk_server_node/basic_sensors_values")
     parser.add_argument("--pointcloud-topic", action="append", default=["/ele_clouds"])
+    parser.add_argument("--move-to-locations-topic", default="/slamware_ros_sdk_server_node/move_to_locations")
+    parser.add_argument("--cancel-action-topic", default="/slamware_ros_sdk_server_node/cancel_action")
+    parser.add_argument("--global-plan-path-topic", default="/slamware_ros_sdk_server_node/global_plan_path")
+    parser.add_argument("--robot-basic-state-topic", default="/slamware_ros_sdk_server_node/robot_basic_state")
+    parser.add_argument("--slamware-state-topic", default="/slamware_ros_sdk_server_node/state")
+    parser.add_argument(
+        "--min-localization-quality",
+        type=int,
+        default=-1,
+        help="Block navigation when localization_quality is below this value. -1 means warn only.",
+    )
     parser.add_argument("--max-cloud-points", type=int, default=6000)
     parser.add_argument("--max-track", type=int, default=1200)
     args = parser.parse_args()
@@ -946,6 +1608,12 @@ def main() -> int:
         odom_topics=args.odom_topic,
         sensors_topic=args.sensors_topic,
         pointcloud_topics=args.pointcloud_topic,
+        move_to_locations_topic=args.move_to_locations_topic,
+        cancel_action_topic=args.cancel_action_topic,
+        global_plan_path_topic=args.global_plan_path_topic,
+        robot_basic_state_topic=args.robot_basic_state_topic,
+        slamware_state_topic=args.slamware_state_topic,
+        min_localization_quality=args.min_localization_quality,
         max_cloud_points=args.max_cloud_points,
     )
 
@@ -958,7 +1626,7 @@ def main() -> int:
     ros_thread = threading.Thread(target=ros_spin, name="ros_spin", daemon=True)
     ros_thread.start()
 
-    handler_cls = type("BoundDashboardHandler", (DashboardHandler,), {"state": state})
+    handler_cls = type("BoundDashboardHandler", (DashboardHandler,), {"state": state, "node_ref": node})
     server = ThreadingHTTPServer((args.bind, args.port), handler_cls)
 
     def shutdown(_signum: int, _frame: Any) -> None:
