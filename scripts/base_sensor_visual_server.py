@@ -11,13 +11,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import signal
 import struct
 import threading
 import time
+import uuid
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path as FsPath
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -73,6 +76,10 @@ def yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
 
 def normalize_angle_rad(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
 def make_reliable_qos(depth: int = 10) -> QoSProfile:
@@ -150,6 +157,177 @@ class SharedState:
         if stamp is None:
             return None
         return round(now - float(stamp), 3)
+
+
+class SavedPointStore:
+    def __init__(self, path: str) -> None:
+        self.path = FsPath(path)
+        self.lock = threading.RLock()
+        self.data: Dict[str, Any] = {"version": 1, "points": []}
+        self.load()
+
+    def load(self) -> None:
+        with self.lock:
+            if not self.path.exists():
+                self.data = {"version": 1, "points": []}
+                return
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                loaded = {"version": 1, "points": []}
+            points = loaded.get("points") if isinstance(loaded, dict) else []
+            if not isinstance(points, list):
+                points = []
+            version = 1
+            if isinstance(loaded, dict):
+                try:
+                    version = int(loaded.get("version", 1))
+                except (TypeError, ValueError):
+                    version = 1
+            self.data = {"version": version, "points": []}
+            for item in points:
+                point = self.normalize_point(item, existing=None, require_xy=True)
+                if point["ok"]:
+                    self.data["points"].append(point["point"])
+
+    def list_payload(self) -> Dict[str, Any]:
+        with self.lock:
+            return {
+                "ok": True,
+                "path": str(self.path),
+                "count": len(self.data["points"]),
+                "points": [dict(point) for point in self.data["points"]],
+            }
+
+    def record_current(self, odom: Optional[Dict[str, Any]], payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not odom or odom.get("x") is None or odom.get("y") is None:
+            return {"ok": False, "error": "current odom is unavailable"}
+        now = now_iso()
+        name = str(payload.get("name") or "").strip() or f"Point {now.replace('T', ' ')}"
+        point_payload = {
+            "name": name,
+            "x": odom.get("x"),
+            "y": odom.get("y"),
+            "yaw": odom.get("yaw", 0.0),
+            "note": payload.get("note", ""),
+            "actions": payload.get("actions", []),
+        }
+        normalized = self.normalize_point(point_payload, existing=None, require_xy=True)
+        if not normalized["ok"]:
+            return normalized
+        point = normalized["point"]
+        point["id"] = self.new_id()
+        point["created_at"] = now
+        point["updated_at"] = now
+        point["source"] = "current_odom"
+        with self.lock:
+            self.data["points"].append(point)
+            self.write_locked()
+        return {"ok": True, "point": point}
+
+    def upsert(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        point_id = str(payload.get("id") or "").strip()
+        with self.lock:
+            existing = self.find_locked(point_id) if point_id else None
+            normalized = self.normalize_point(payload, existing=existing, require_xy=True)
+            if not normalized["ok"]:
+                return normalized
+            point = normalized["point"]
+            now = now_iso()
+            if existing:
+                point["id"] = existing["id"]
+                point["created_at"] = existing.get("created_at") or now
+                point["updated_at"] = now
+                point["source"] = existing.get("source") or "manual"
+                self.data["points"] = [point if item.get("id") == point["id"] else item for item in self.data["points"]]
+            else:
+                point["id"] = self.new_id()
+                point["created_at"] = now
+                point["updated_at"] = now
+                point["source"] = str(payload.get("source") or "manual")
+                self.data["points"].append(point)
+            self.write_locked()
+        return {"ok": True, "point": point}
+
+    def delete(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        point_id = str(payload.get("id") or "").strip()
+        if not point_id:
+            return {"ok": False, "error": "missing point id"}
+        with self.lock:
+            before = len(self.data["points"])
+            self.data["points"] = [point for point in self.data["points"] if point.get("id") != point_id]
+            if len(self.data["points"]) == before:
+                return {"ok": False, "error": "point not found", "id": point_id}
+            self.write_locked()
+        return {"ok": True, "deleted_id": point_id}
+
+    def normalize_point(
+        self,
+        payload: Any,
+        existing: Optional[Dict[str, Any]],
+        require_xy: bool,
+    ) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "point payload must be an object"}
+        x = finite_or_none(payload.get("x"), 5)
+        y = finite_or_none(payload.get("y"), 5)
+        if require_xy and (x is None or y is None):
+            return {"ok": False, "error": "point x/y are required"}
+        yaw = self.resolve_yaw(payload, existing)
+        if yaw is None:
+            return {"ok": False, "error": "invalid yaw/yaw_deg"}
+        name = str(payload.get("name") or (existing or {}).get("name") or "Point").strip() or "Point"
+        note = str(payload.get("note") if payload.get("note") is not None else (existing or {}).get("note", ""))
+        actions = payload.get("actions", (existing or {}).get("actions", []))
+        if not isinstance(actions, list):
+            return {"ok": False, "error": "actions must be a JSON list"}
+        point = {
+            "id": str((existing or {}).get("id") or payload.get("id") or ""),
+            "name": name[:80],
+            "x": x,
+            "y": y,
+            "yaw": round(yaw, 6),
+            "yaw_deg": round(math.degrees(yaw), 3),
+            "note": note[:500],
+            "actions": actions,
+        }
+        for key in ("created_at", "updated_at", "source"):
+            if existing and existing.get(key) is not None:
+                point[key] = existing[key]
+            elif payload.get(key) is not None:
+                point[key] = payload[key]
+        return {"ok": True, "point": point}
+
+    @staticmethod
+    def resolve_yaw(payload: Dict[str, Any], existing: Optional[Dict[str, Any]]) -> Optional[float]:
+        raw_yaw = payload.get("yaw")
+        raw_yaw_deg = payload.get("yaw_deg")
+        if raw_yaw is not None:
+            yaw = finite_or_none(raw_yaw)
+            return normalize_angle_rad(float(yaw)) if yaw is not None else None
+        if raw_yaw_deg is not None:
+            yaw_deg = finite_or_none(raw_yaw_deg)
+            return normalize_angle_rad(math.radians(float(yaw_deg))) if yaw_deg is not None else None
+        if existing and existing.get("yaw") is not None:
+            yaw = finite_or_none(existing.get("yaw"))
+            return normalize_angle_rad(float(yaw)) if yaw is not None else None
+        return 0.0
+
+    def find_locked(self, point_id: str) -> Optional[Dict[str, Any]]:
+        for point in self.data["points"]:
+            if point.get("id") == point_id:
+                return point
+        return None
+
+    def write_locked(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, self.path)
+
+    @staticmethod
+    def new_id() -> str:
+        return "pt_" + uuid.uuid4().hex[:12]
 
 
 class BaseSensorNode(Node):
@@ -894,6 +1072,87 @@ HTML = r"""<!doctype html>
       padding: 8px 10px;
       font: inherit;
     }
+    .point-panel-body {
+      display: grid;
+      grid-template-columns: minmax(280px, 0.85fr) minmax(280px, 1fr);
+      gap: 10px;
+      padding: 10px;
+    }
+    .point-form {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+    .point-form label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .point-form input,
+    .point-form textarea {
+      width: 100%;
+      border: 1px solid #b9c6d8;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+      background: #fff;
+      color: var(--text);
+    }
+    .point-form textarea {
+      min-height: 62px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+    }
+    .point-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .point-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 0;
+    }
+    .point-message {
+      min-height: 20px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .point-message.bad { color: var(--warn); }
+    .point-message.ok { color: var(--ok); }
+    .point-list {
+      display: grid;
+      align-content: start;
+      gap: 8px;
+      max-height: 420px;
+      overflow: auto;
+      min-width: 0;
+    }
+    .point-item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px;
+      background: #fbfcfe;
+      cursor: pointer;
+    }
+    .point-item.active {
+      border-color: #0ea5e9;
+      background: #f0f9ff;
+    }
+    .point-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 750;
+    }
+    .point-detail {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
     .nav-status {
       padding: 0 10px 10px;
       color: var(--muted);
@@ -923,6 +1182,7 @@ HTML = r"""<!doctype html>
     @media (max-width: 980px) {
       main { grid-template-columns: 1fr; }
       .readout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .point-panel-body { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -960,6 +1220,52 @@ HTML = r"""<!doctype html>
         <div class="metric"><div class="label">定位</div><div id="localizationState" class="value">--</div></div>
         <div class="metric"><div class="label">导航指令</div><div id="navCommand" class="value">--</div></div>
         <div class="metric"><div class="label">目标角度</div><div id="targetYaw" class="value">--</div></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="panel-head">
+        <h2>点位库 / 动作预留</h2>
+        <span id="pointsMeta" class="meta">waiting</span>
+      </div>
+      <div class="point-panel-body">
+        <div class="point-form">
+          <div class="point-grid">
+            <div>
+              <label for="pointNameInput">名称</label>
+              <input id="pointNameInput" type="text" placeholder="例如：货架 A 点" />
+            </div>
+            <div>
+              <label for="pointYawDegInput">朝向 deg</label>
+              <input id="pointYawDegInput" type="number" step="0.1" placeholder="0" />
+            </div>
+            <div>
+              <label for="pointXInput">X m</label>
+              <input id="pointXInput" type="number" step="0.001" placeholder="地图 X" />
+            </div>
+            <div>
+              <label for="pointYInput">Y m</label>
+              <input id="pointYInput" type="number" step="0.001" placeholder="地图 Y" />
+            </div>
+          </div>
+          <div>
+            <label for="pointNoteInput">备注</label>
+            <textarea id="pointNoteInput" placeholder="可写用途、货架、调试说明"></textarea>
+          </div>
+          <div>
+            <label for="pointActionsInput">动作 JSON（预留，不执行）</label>
+            <textarea id="pointActionsInput" spellcheck="false">[]</textarea>
+          </div>
+          <div class="point-actions">
+            <button id="recordCurrentPointBtn" class="primary">记录当前位置</button>
+            <button id="newPointBtn">新建/清空</button>
+            <button id="savePointBtn">保存点位</button>
+            <button id="addPointToNavBtn">加入导航</button>
+            <button id="deletePointBtn" class="danger">删除</button>
+          </div>
+          <div id="pointMessage" class="point-message">动作字段只保存，不执行；后续接机械臂时复用。</div>
+        </div>
+        <div id="savedPointList" class="point-list"></div>
       </div>
     </section>
 
@@ -1017,6 +1323,8 @@ HTML = r"""<!doctype html>
     let lastState = null;
     let currentMapGeom = null;
     let selectedWaypoints = [];
+    let savedPoints = [];
+    let editingPointId = null;
     let headingMode = false;
     let finalHeadingPoint = null;
     let manualHeadingDeg = null;
@@ -1040,6 +1348,16 @@ HTML = r"""<!doctype html>
     function fmt(value, digits = 2, suffix = '') {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return '--';
       return `${Number(value).toFixed(digits)}${suffix}`;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      })[ch]);
     }
 
     function normalizeAngle(angle) {
@@ -1200,6 +1518,36 @@ HTML = r"""<!doctype html>
       });
     }
 
+    function drawSavedPoints(ctx, map, geom) {
+      if (!savedPoints.length) return;
+      const dpr = window.devicePixelRatio || 1;
+      savedPoints.forEach(point => {
+        if (point.x === null || point.x === undefined || point.y === null || point.y === undefined) return;
+        const c = mapToCanvas(map, point.x, point.y, geom);
+        const active = point.id === editingPointId;
+        ctx.save();
+        ctx.fillStyle = active ? '#f59e0b' : '#0ea5e9';
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 3 * dpr;
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, (active ? 9 : 7) * dpr, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        if (point.yaw !== null && point.yaw !== undefined) {
+          const len = 28 * dpr;
+          drawArrow(ctx, c, { x: c.x + Math.cos(point.yaw) * len, y: c.y - Math.sin(point.yaw) * len }, '#0f766e', '');
+        }
+        ctx.font = `${11 * dpr}px system-ui, sans-serif`;
+        ctx.lineWidth = 3 * dpr;
+        ctx.strokeStyle = '#ffffff';
+        ctx.fillStyle = '#0f172a';
+        const label = point.name || 'Point';
+        ctx.strokeText(label, c.x + 10 * dpr, c.y - 10 * dpr);
+        ctx.fillText(label, c.x + 10 * dpr, c.y - 10 * dpr);
+        ctx.restore();
+      });
+    }
+
     function drawGlobalPlan(ctx, map, geom, nav) {
       const path = nav?.global_plan_path?.poses || [];
       drawMapPolyline(ctx, map, geom, path, '#d97706', 4, false);
@@ -1284,6 +1632,7 @@ HTML = r"""<!doctype html>
         ctx.restore();
       }
 
+      drawSavedPoints(ctx, map, geom);
       drawSelectedWaypoints(ctx, map, geom);
       drawTargetHeading(ctx, map, geom, state);
 
@@ -1543,6 +1892,195 @@ HTML = r"""<!doctype html>
       return data;
     }
 
+    function setPointMessage(kind, text) {
+      const el = document.getElementById('pointMessage');
+      el.className = `point-message ${kind || ''}`.trim();
+      el.textContent = text;
+    }
+
+    function setPointForm(point) {
+      editingPointId = point?.id || null;
+      document.getElementById('pointNameInput').value = point?.name || '';
+      document.getElementById('pointXInput').value = point?.x !== undefined && point?.x !== null ? Number(point.x).toFixed(4) : '';
+      document.getElementById('pointYInput').value = point?.y !== undefined && point?.y !== null ? Number(point.y).toFixed(4) : '';
+      document.getElementById('pointYawDegInput').value = point?.yaw_deg !== undefined && point?.yaw_deg !== null ? Number(point.yaw_deg).toFixed(1) : '';
+      document.getElementById('pointNoteInput').value = point?.note || '';
+      document.getElementById('pointActionsInput').value = JSON.stringify(point?.actions || [], null, 2);
+      renderSavedPoints();
+      refreshMapUi();
+    }
+
+    function clearPointForm() {
+      setPointForm(null);
+      document.getElementById('pointActionsInput').value = '[]';
+      setPointMessage('', '动作字段只保存，不执行；后续接机械臂时复用。');
+    }
+
+    function parseActionsInput() {
+      const raw = document.getElementById('pointActionsInput').value.trim();
+      if (!raw) return [];
+      let actions;
+      try {
+        actions = JSON.parse(raw);
+      } catch (err) {
+        throw new Error(`动作 JSON 格式不对：${err.message}`);
+      }
+      if (!Array.isArray(actions)) {
+        throw new Error('动作 JSON 必须是数组，例如 [{"type":"pick"}]');
+      }
+      return actions;
+    }
+
+    function buildPointPayload(includeId = true) {
+      const x = Number(document.getElementById('pointXInput').value);
+      const y = Number(document.getElementById('pointYInput').value);
+      const yawDeg = Number(document.getElementById('pointYawDegInput').value || 0);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        throw new Error('请填写有效的 X / Y 坐标');
+      }
+      if (!Number.isFinite(yawDeg)) {
+        throw new Error('请填写有效的朝向角度');
+      }
+      const payload = {
+        name: document.getElementById('pointNameInput').value.trim(),
+        x,
+        y,
+        yaw_deg: yawDeg,
+        note: document.getElementById('pointNoteInput').value,
+        actions: parseActionsInput()
+      };
+      if (includeId && editingPointId) payload.id = editingPointId;
+      return payload;
+    }
+
+    async function loadSavedPoints() {
+      try {
+        const res = await fetch('/api/points', { cache: 'no-store' });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'load points failed');
+        savedPoints = data.points || [];
+        if (editingPointId && !savedPoints.some(point => point.id === editingPointId)) {
+          editingPointId = null;
+        }
+        renderSavedPoints();
+        document.getElementById('pointsMeta').textContent = `${savedPoints.length} saved`;
+        refreshMapUi();
+      } catch (err) {
+        document.getElementById('pointsMeta').textContent = 'load failed';
+        setPointMessage('bad', `点位列表读取失败：${err}`);
+      }
+    }
+
+    function renderSavedPoints() {
+      const list = document.getElementById('savedPointList');
+      if (!savedPoints.length) {
+        list.innerHTML = '<div class="point-item"><div class="point-title"><span>暂无保存点位</span></div><div class="point-detail">可以先点击“记录当前位置”，也可以手动填写 X/Y 后保存。</div></div>';
+        return;
+      }
+      list.innerHTML = savedPoints.map(point => {
+        const active = point.id === editingPointId ? 'active' : '';
+        const actionsCount = Array.isArray(point.actions) ? point.actions.length : 0;
+        return `<div class="point-item ${active}" data-point-id="${escapeHtml(point.id)}">
+          <div class="point-title">
+            <span>${escapeHtml(point.name || 'Point')}</span>
+            <span>${Number(point.yaw_deg || 0).toFixed(1)}°</span>
+          </div>
+          <div class="point-detail">x=${Number(point.x).toFixed(3)}m, y=${Number(point.y).toFixed(3)}m · ${escapeHtml(point.source || 'manual')} · actions ${actionsCount}</div>
+          ${point.note ? `<div class="point-detail">${escapeHtml(point.note)}</div>` : ''}
+        </div>`;
+      }).join('');
+      list.querySelectorAll('.point-item[data-point-id]').forEach(item => {
+        item.addEventListener('click', () => {
+          const point = savedPoints.find(p => p.id === item.getAttribute('data-point-id'));
+          if (point) {
+            setPointForm(point);
+            setPointMessage('', `正在编辑：${point.name || 'Point'}`);
+          }
+        });
+      });
+    }
+
+    async function recordCurrentPoint() {
+      let actions;
+      try {
+        actions = parseActionsInput();
+      } catch (err) {
+        setPointMessage('bad', err.message);
+        return;
+      }
+      setPointMessage('', '正在记录当前机器人位置...');
+      const data = await postJson('/api/points/record_current', {
+        name: document.getElementById('pointNameInput').value.trim(),
+        note: document.getElementById('pointNoteInput').value,
+        actions
+      });
+      if (!data.ok) {
+        setPointMessage('bad', `记录失败：${data.error || 'unknown error'}`);
+        return;
+      }
+      editingPointId = data.point.id;
+      await loadSavedPoints();
+      const point = savedPoints.find(p => p.id === editingPointId);
+      if (point) setPointForm(point);
+      setPointMessage('ok', `已记录当前位置：${data.point.name}`);
+    }
+
+    async function savePoint() {
+      let payload;
+      try {
+        payload = buildPointPayload(true);
+      } catch (err) {
+        setPointMessage('bad', err.message);
+        return;
+      }
+      const data = await postJson('/api/points/upsert', payload);
+      if (!data.ok) {
+        setPointMessage('bad', `保存失败：${data.error || 'unknown error'}`);
+        return;
+      }
+      editingPointId = data.point.id;
+      await loadSavedPoints();
+      const point = savedPoints.find(p => p.id === editingPointId);
+      if (point) setPointForm(point);
+      setPointMessage('ok', `已保存点位：${data.point.name}`);
+    }
+
+    async function deletePoint() {
+      if (!editingPointId) {
+        setPointMessage('bad', '请先在列表里选中一个点位');
+        return;
+      }
+      if (!window.confirm('确定删除这个点位吗？')) return;
+      const data = await postJson('/api/points/delete', { id: editingPointId });
+      if (!data.ok) {
+        setPointMessage('bad', `删除失败：${data.error || 'unknown error'}`);
+        return;
+      }
+      clearPointForm();
+      await loadSavedPoints();
+      setPointMessage('ok', '点位已删除');
+    }
+
+    function addEditedPointToNav() {
+      let payload;
+      try {
+        payload = buildPointPayload(false);
+      } catch (err) {
+        setPointMessage('bad', err.message);
+        return;
+      }
+      selectedWaypoints.push({
+        x: Number(payload.x.toFixed(4)),
+        y: Number(payload.y.toFixed(4))
+      });
+      manualHeadingDeg = Number(radToDeg(normalizeAngle(payload.yaw_deg * Math.PI / 180)).toFixed(3));
+      finalHeadingPoint = null;
+      document.getElementById('headingDegInput').value = manualHeadingDeg.toFixed(1);
+      setHeadingMode(false);
+      refreshMapUi();
+      setPointMessage('ok', `已加入导航队列：${payload.name || 'Point'}，朝向 ${manualHeadingDeg.toFixed(1)}°`);
+    }
+
     function setHeadingMode(enabled) {
       headingMode = Boolean(enabled);
       document.getElementById('setHeadingBtn').classList.toggle('active', headingMode);
@@ -1700,6 +2238,11 @@ HTML = r"""<!doctype html>
     });
     document.getElementById('startNavigationBtn').addEventListener('click', startNavigation);
     document.getElementById('stopNavigationBtn').addEventListener('click', stopNavigation);
+    document.getElementById('recordCurrentPointBtn').addEventListener('click', recordCurrentPoint);
+    document.getElementById('newPointBtn').addEventListener('click', clearPointForm);
+    document.getElementById('savePointBtn').addEventListener('click', savePoint);
+    document.getElementById('addPointToNavBtn').addEventListener('click', addEditedPointToNav);
+    document.getElementById('deletePointBtn').addEventListener('click', deletePoint);
 
     cloudCanvas.addEventListener('pointerdown', ev => {
       cloudDragging = true;
@@ -1719,6 +2262,7 @@ HTML = r"""<!doctype html>
 
     window.addEventListener('resize', () => { cachedMapSeq = -1; tick(); });
     setInterval(tick, 500);
+    loadSavedPoints();
     tick();
   </script>
 </body>
@@ -1729,6 +2273,7 @@ HTML = r"""<!doctype html>
 class DashboardHandler(BaseHTTPRequestHandler):
     state: SharedState
     node_ref: BaseSensorNode
+    point_store: SavedPointStore
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
@@ -1739,6 +2284,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.write_bytes(HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif parsed.path == "/api/state":
             self.write_json(self.state.snapshot())
+        elif parsed.path == "/api/points":
+            self.write_json(self.point_store.list_payload())
         elif parsed.path == "/api/health":
             snap = self.state.snapshot()
             self.write_json(
@@ -1768,6 +2315,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.write_json(self.node_ref.start_navigation(payload))
         elif parsed.path in ("/api/navigation/cancel", "/api/nav/cancel", "/api/navigation/stop", "/api/nav/stop"):
             self.write_json(self.node_ref.cancel_navigation())
+        elif parsed.path == "/api/points/record_current":
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.point_store.record_current(self.state.snapshot().get("odom"), payload))
+        elif parsed.path == "/api/points/upsert":
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.point_store.upsert(payload))
+        elif parsed.path == "/api/points/delete":
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.point_store.delete(payload))
+        elif parsed.path == "/api/actions/execute":
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(
+                {
+                    "ok": False,
+                    "error": "action execution is reserved but not implemented",
+                    "received": payload,
+                }
+            )
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
@@ -1820,6 +2393,7 @@ def main() -> int:
     parser.add_argument("--global-plan-path-topic", default="/slamware_ros_sdk_server_node/global_plan_path")
     parser.add_argument("--robot-basic-state-topic", default="/slamware_ros_sdk_server_node/robot_basic_state")
     parser.add_argument("--slamware-state-topic", default="/slamware_ros_sdk_server_node/state")
+    parser.add_argument("--points-file", default="data/nav_points.json")
     parser.add_argument(
         "--min-localization-quality",
         type=int,
@@ -1831,6 +2405,7 @@ def main() -> int:
     args = parser.parse_args()
 
     state = SharedState(max_track=args.max_track)
+    point_store = SavedPointStore(args.points_file)
     rclpy.init()
     node = BaseSensorNode(
         state=state,
@@ -1857,7 +2432,11 @@ def main() -> int:
     ros_thread = threading.Thread(target=ros_spin, name="ros_spin", daemon=True)
     ros_thread.start()
 
-    handler_cls = type("BoundDashboardHandler", (DashboardHandler,), {"state": state, "node_ref": node})
+    handler_cls = type(
+        "BoundDashboardHandler",
+        (DashboardHandler,),
+        {"state": state, "node_ref": node, "point_store": point_store},
+    )
     server = ThreadingHTTPServer((args.bind, args.port), handler_cls)
 
     def shutdown(_signum: int, _frame: Any) -> None:

@@ -167,3 +167,46 @@ bash scripts/base_sensor_visual_server.sh --pointcloud-topic /camera/depth/point
 ```bash
 pkill -f 'scripts/base_sensor_visual_server.py'
 ```
+
+## 点位库 / 动作预留
+
+页面里的 `点位库 / 动作预留` 用来保存可复用导航点位：
+
+- `记录当前位置`：读取当前 `/slamware_ros_sdk_server_node/odom`，保存当前机器人 `x/y/yaw`。
+- `保存点位`：手动新建或编辑点位，字段包括名称、`x`、`y`、`yaw_deg`、备注、动作 JSON。
+- `加入导航`：把点位追加到当前页面的航点队列，并把点位 `yaw_deg` 同步成终点目标角度；不会自动开始导航。
+- 动作 JSON 只是预留字段，当前不会调用机械臂，也不会执行任何动作。
+
+默认数据文件：
+
+```text
+data/nav_points.json
+```
+
+启动时可以改路径：
+
+```bash
+bash scripts/base_sensor_visual_server.sh --points-file /home/unitree/G1D_SLAM/data/nav_points.json
+```
+
+常用 API：
+
+```bash
+# 查看点位列表
+curl -s http://127.0.0.1:18083/api/points
+
+# 保存当前机器人位置
+curl -s -X POST http://127.0.0.1:18083/api/points/record_current \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"货架A等待点","actions":[]}'
+
+# 手动保存点位
+curl -s -X POST http://127.0.0.1:18083/api/points/upsert \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"手动点","x":1.2,"y":0.8,"yaw_deg":90,"note":"测试","actions":[]}'
+
+# 删除点位
+curl -s -X POST http://127.0.0.1:18083/api/points/delete \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"pt_xxx"}'
+```

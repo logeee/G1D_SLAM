@@ -134,3 +134,28 @@ curl -s -X POST http://127.0.0.1:18083/api/navigation/start \
 ```bash
 curl -s -X POST http://127.0.0.1:18083/api/navigation/cancel -d '{}'
 ```
+
+## 点位库 / 动作预留
+
+18083 页面支持保存导航点位：
+
+- `记录当前位置`：用当前 odom 的 `x/y/yaw` 生成一个点位。
+- `保存点位`：手动编辑点位名称、`x/y/yaw_deg`、备注和动作 JSON。
+- `加入导航`：把当前编辑点位加入页面上的航点队列，并把点位朝向作为终点 yaw；不会自动开始导航。
+- `动作 JSON`：当前只保存，不执行，后续接机械臂动作时复用。
+
+默认保存文件是 `data/nav_points.json`，启动时可用 `--points-file` 改路径。
+
+点位 API：
+
+```bash
+curl -s http://127.0.0.1:18083/api/points
+
+curl -s -X POST http://127.0.0.1:18083/api/points/record_current \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"货架A等待点","actions":[]}'
+
+curl -s -X POST http://127.0.0.1:18083/api/points/upsert \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"手动点","x":1.2,"y":0.8,"yaw_deg":90,"actions":[]}'
+```
