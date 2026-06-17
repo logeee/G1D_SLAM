@@ -967,6 +967,134 @@ HTML = r"""<!doctype html>
       min-width: 0;
       overflow: hidden;
     }
+    .map-section { grid-column: 1 / -1; }
+    .map-workflow-grid {
+      display: grid;
+      grid-template-columns: minmax(420px, 1fr) minmax(300px, 360px);
+      gap: 12px;
+      padding: 10px;
+    }
+    .map-workflow-grid .canvas-wrap { padding: 0; }
+    .workflow-panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      min-width: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .workflow-head {
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: baseline;
+    }
+    .workflow-head strong { font-size: 15px; }
+    .workflow-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+    }
+    .workflow-list {
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      max-height: 520px;
+      overflow: auto;
+      align-content: start;
+    }
+    .workflow-step {
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px;
+      overflow: hidden;
+    }
+    .workflow-step::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: var(--progress, 0%);
+      background: rgba(37, 99, 235, 0.10);
+      transition: width 0.35s ease;
+      pointer-events: none;
+    }
+    .workflow-step.running {
+      border-color: #60a5fa;
+      box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.18);
+    }
+    .workflow-step.done {
+      border-color: #86efac;
+      background: #f0fdf4;
+    }
+    .workflow-step.error {
+      border-color: #fecaca;
+      background: #fff7f7;
+    }
+    .workflow-step-content {
+      position: relative;
+      display: grid;
+      gap: 5px;
+    }
+    .workflow-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 750;
+    }
+    .workflow-detail {
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .workflow-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 44px;
+      border-radius: 999px;
+      padding: 2px 8px;
+      background: #e2e8f0;
+      color: #334155;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .workflow-step.running .workflow-badge {
+      background: #dbeafe;
+      color: #1d4ed8;
+    }
+    .workflow-step.done .workflow-badge {
+      background: #dcfce7;
+      color: #15803d;
+    }
+    .workflow-step.error .workflow-badge {
+      background: #fee2e2;
+      color: #b91c1c;
+    }
+    .workflow-pulse {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #2563eb;
+      display: inline-block;
+      margin-right: 6px;
+      visibility: hidden;
+    }
+    .workflow-step.running .workflow-pulse {
+      animation: workflowPulse 0.9s ease-in-out infinite;
+      visibility: visible;
+    }
+    @keyframes workflowPulse {
+      0%, 100% { transform: scale(0.8); opacity: 0.55; }
+      50% { transform: scale(1.25); opacity: 1; }
+    }
     .panel-head {
       display: flex;
       align-items: baseline;
@@ -1181,6 +1309,7 @@ HTML = r"""<!doctype html>
     }
     @media (max-width: 980px) {
       main { grid-template-columns: 1fr; }
+      .map-workflow-grid { grid-template-columns: 1fr; }
       .readout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .point-panel-body { grid-template-columns: 1fr; }
     }
@@ -1192,11 +1321,13 @@ HTML = r"""<!doctype html>
     <div class="status"><span id="statusDot" class="dot"></span><span id="statusText">connecting</span></div>
   </header>
   <main>
-    <section>
+    <section class="map-section">
       <div class="panel-head">
         <h2>SLAM Map + Odometry</h2>
         <span id="mapMeta" class="meta">waiting</span>
       </div>
+      <div class="map-workflow-grid">
+        <div>
       <div class="canvas-wrap"><canvas id="mapCanvas"></canvas></div>
       <div class="toolbar">
         <button id="undoWaypointBtn">撤销点</button>
@@ -1206,6 +1337,7 @@ HTML = r"""<!doctype html>
         <input id="headingDegInput" class="heading-input" type="number" step="1" min="-180" max="180" placeholder="角度°" />
         <button id="applyHeadingDegBtn">应用角度</button>
         <button id="startNavigationBtn" class="primary">开始导航</button>
+        <button id="runWorkflowBtn" class="primary">执行动作链</button>
         <button id="stopNavigationBtn" class="danger">停止导航</button>
         <span id="navHint" class="nav-hint">在地图上点击添加航点</span>
       </div>
@@ -1220,6 +1352,19 @@ HTML = r"""<!doctype html>
         <div class="metric"><div class="label">定位</div><div id="localizationState" class="value">--</div></div>
         <div class="metric"><div class="label">导航指令</div><div id="navCommand" class="value">--</div></div>
         <div class="metric"><div class="label">目标角度</div><div id="targetYaw" class="value">--</div></div>
+      </div>
+        </div>
+        <aside class="workflow-panel">
+          <div class="workflow-head">
+            <strong>动作链</strong>
+            <span id="workflowMeta" class="meta">待执行</span>
+          </div>
+          <div class="workflow-actions">
+            <button id="addFakePickBtn">加入“拾取熊猫烟”</button>
+            <button id="resetWorkflowBtn">重置状态</button>
+          </div>
+          <div id="workflowList" class="workflow-list"></div>
+        </aside>
       </div>
     </section>
 
@@ -1325,6 +1470,18 @@ HTML = r"""<!doctype html>
     let selectedWaypoints = [];
     let savedPoints = [];
     let editingPointId = null;
+    let extraActionModules = [{ id: 'fake-pick-xiongmao', type: 'fake_pick_xiongmao', title: '拾取熊猫烟', durationSec: 5 }];
+    let workflowRun = {
+      running: false,
+      mode: 'idle',
+      currentIndex: -1,
+      completed: {},
+      error: '',
+      navigationStartedAt: 0,
+      actionStartedAt: 0,
+      actionDurationSec: 5,
+      note: ''
+    };
     let headingMode = false;
     let finalHeadingPoint = null;
     let manualHeadingDeg = null;
@@ -1839,6 +1996,7 @@ HTML = r"""<!doctype html>
         renderSensors(state);
         updateReadouts(state);
         updateNavigationStatus(state);
+        updateWorkflowProgress(state);
         document.getElementById('rawState').textContent = JSON.stringify({
           freshness_s: state.freshness_s,
           seq: state.seq,
@@ -1862,6 +2020,7 @@ HTML = r"""<!doctype html>
 
     function setNavButtonsBusy(busy) {
       document.getElementById('startNavigationBtn').disabled = busy;
+      document.getElementById('runWorkflowBtn').disabled = busy;
       document.getElementById('stopNavigationBtn').disabled = busy;
       document.getElementById('undoWaypointBtn').disabled = busy;
       document.getElementById('clearWaypointsBtn').disabled = busy;
@@ -1890,6 +2049,221 @@ HTML = r"""<!doctype html>
       catch (err) { data = { ok: false, error: text || String(err) }; }
       if (!res.ok) data.ok = false;
       return data;
+    }
+
+    function sleepMs(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function waypointModuleId(index) {
+      return `nav-${index}`;
+    }
+
+    function getWorkflowModules() {
+      const navModules = selectedWaypoints.map((point, index) => ({
+        id: waypointModuleId(index),
+        type: 'navigate',
+        title: `导航点 ${index + 1}`,
+        x: point.x,
+        y: point.y,
+        index
+      }));
+      return navModules.concat(extraActionModules.map(action => ({ ...action })));
+    }
+
+    function resetWorkflowRun(note = '待执行') {
+      workflowRun = {
+        running: false,
+        mode: 'idle',
+        currentIndex: -1,
+        completed: {},
+        error: '',
+        navigationStartedAt: 0,
+        actionStartedAt: 0,
+        actionDurationSec: 5,
+        startPose: null,
+        note
+      };
+      setWorkflowRunningUi(false);
+      renderWorkflow();
+    }
+
+    function beginWorkflowRun(mode) {
+      workflowRun = {
+        running: true,
+        mode,
+        currentIndex: selectedWaypoints.length ? 0 : selectedWaypoints.length,
+        completed: {},
+        error: '',
+        navigationStartedAt: Date.now(),
+        actionStartedAt: 0,
+        actionDurationSec: 5,
+        startPose: lastState?.odom ? { x: lastState.odom.x, y: lastState.odom.y } : null,
+        note: mode === 'chain' ? '动作链执行中' : '导航执行中'
+      };
+      renderWorkflow();
+    }
+
+    function markWorkflowError(message) {
+      workflowRun.running = false;
+      workflowRun.error = message || '执行失败';
+      workflowRun.note = workflowRun.error;
+      setWorkflowRunningUi(false);
+      renderWorkflow();
+    }
+
+    function setWorkflowRunningUi(running) {
+      const ids = [
+        'startNavigationBtn',
+        'runWorkflowBtn',
+        'undoWaypointBtn',
+        'clearWaypointsBtn',
+        'setHeadingBtn',
+        'clearHeadingBtn',
+        'headingDegInput',
+        'applyHeadingDegBtn',
+        'addPointToNavBtn',
+        'addFakePickBtn'
+      ];
+      ids.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = Boolean(running);
+      });
+      const stopBtn = document.getElementById('stopNavigationBtn');
+      if (stopBtn) stopBtn.disabled = false;
+    }
+
+    function distanceToWaypoint(point, state = lastState) {
+      if (!state?.odom || point?.x === undefined || point?.y === undefined) return null;
+      return Math.hypot(Number(state.odom.x) - Number(point.x), Number(state.odom.y) - Number(point.y));
+    }
+
+    function isWaypointReached(point, state = lastState) {
+      const dist = distanceToWaypoint(point, state);
+      return dist !== null && dist <= 0.18;
+    }
+
+    function finalWaypointReached(state = lastState) {
+      if (!selectedWaypoints.length) return true;
+      return isWaypointReached(selectedWaypoints[selectedWaypoints.length - 1], state);
+    }
+
+    function estimateNavProgress(point, index, state = lastState) {
+      const dist = distanceToWaypoint(point, state);
+      if (dist === null) return 0;
+      let start = null;
+      if (index === 0) start = workflowRun.startPose;
+      else start = selectedWaypoints[index - 1];
+      const total = start ? Math.hypot(Number(point.x) - Number(start.x), Number(point.y) - Number(start.y)) : Math.max(dist, 0.01);
+      if (total < 0.01) return isWaypointReached(point, state) ? 1 : 0;
+      return Math.max(0, Math.min(1, 1 - dist / total));
+    }
+
+    function updateWorkflowProgress(state) {
+      if (!workflowRun.running) {
+        renderWorkflow();
+        return;
+      }
+      const modules = getWorkflowModules();
+      if (!modules.length) {
+        workflowRun.running = false;
+        workflowRun.note = '没有动作模块';
+        renderWorkflow();
+        return;
+      }
+
+      for (let i = 0; i < selectedWaypoints.length; i++) {
+        if (isWaypointReached(selectedWaypoints[i], state)) {
+          workflowRun.completed[waypointModuleId(i)] = true;
+        }
+      }
+
+      if (workflowRun.currentIndex < selectedWaypoints.length) {
+        const nextIndex = selectedWaypoints.findIndex((point, index) => !workflowRun.completed[waypointModuleId(index)]);
+        if (nextIndex >= 0) {
+          workflowRun.currentIndex = nextIndex;
+        } else if (workflowRun.mode === 'navigation') {
+          workflowRun.running = false;
+          workflowRun.currentIndex = selectedWaypoints.length - 1;
+          workflowRun.note = '导航完成';
+          setWorkflowRunningUi(false);
+        }
+      }
+      renderWorkflow();
+    }
+
+    function workflowStepStatus(module, index) {
+      if (workflowRun.error && index === workflowRun.currentIndex) return 'error';
+      if (workflowRun.completed[module.id]) return 'done';
+      if (workflowRun.running && index === workflowRun.currentIndex) return 'running';
+      return 'queued';
+    }
+
+    function workflowStepProgress(module, index) {
+      const status = workflowStepStatus(module, index);
+      if (status === 'done') return 100;
+      if (status !== 'running') return 0;
+      if (module.type === 'navigate') return Math.round(estimateNavProgress(module, module.index, lastState) * 100);
+      if (module.type === 'fake_pick_xiongmao') {
+        if (!workflowRun.actionStartedAt) return 0;
+        const elapsed = (Date.now() - workflowRun.actionStartedAt) / 1000;
+        const total = Math.max(0.1, workflowRun.actionDurationSec || module.durationSec || 5);
+        return Math.round(Math.max(0, Math.min(1, elapsed / total)) * 100);
+      }
+      return 0;
+    }
+
+    function renderWorkflow() {
+      const list = document.getElementById('workflowList');
+      const meta = document.getElementById('workflowMeta');
+      if (!list || !meta) return;
+      const modules = getWorkflowModules();
+      const doneCount = modules.filter(module => workflowRun.completed[module.id]).length;
+      meta.textContent = workflowRun.running
+        ? `执行中 ${Math.min(workflowRun.currentIndex + 1, modules.length)}/${modules.length}`
+        : `${doneCount}/${modules.length} 完成`;
+      if (!modules.length) {
+        list.innerHTML = '<div class="workflow-step"><div class="workflow-step-content"><div class="workflow-title">暂无动作模块</div><div class="workflow-detail">在地图上添加导航点，或加入后续动作模块。</div></div></div>';
+        return;
+      }
+      list.innerHTML = modules.map((module, index) => {
+        const status = workflowStepStatus(module, index);
+        const progress = workflowStepProgress(module, index);
+        const badge = status === 'done' ? '完成' : status === 'running' ? '进行中' : status === 'error' ? '异常' : '等待';
+        const title = module.type === 'navigate'
+          ? `${index + 1}. ${module.title}`
+          : `${index + 1}. ${module.title}`;
+        const detail = module.type === 'navigate'
+          ? `目标 x=${Number(module.x).toFixed(3)}m, y=${Number(module.y).toFixed(3)}m`
+          : `假动作模块：后端休眠 ${module.durationSec || 5}s，后续可替换为机械臂动作`;
+        return `<div class="workflow-step ${status}" style="--progress:${progress}%">
+          <div class="workflow-step-content">
+            <div class="workflow-title">
+              <span><span class="workflow-pulse"></span>${escapeHtml(title)}</span>
+              <span class="workflow-badge">${badge}</span>
+            </div>
+            <div class="workflow-detail">${escapeHtml(detail)}</div>
+            <div class="workflow-detail">进度 ${progress}%</div>
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    function addFakePickModule() {
+      if (!extraActionModules.some(module => module.type === 'fake_pick_xiongmao')) {
+        extraActionModules.push({ id: 'fake-pick-xiongmao', type: 'fake_pick_xiongmao', title: '拾取熊猫烟', durationSec: 5 });
+      }
+      renderWorkflow();
+    }
+
+    async function waitForFinalWaypoint(timeoutMs = 180000) {
+      const started = Date.now();
+      while (workflowRun.running && Date.now() - started < timeoutMs) {
+        if (finalWaypointReached(lastState)) return true;
+        await sleepMs(500);
+      }
+      if (!workflowRun.running) throw new Error('动作链已停止');
+      throw new Error('等待导航到达超时');
     }
 
     function setPointMessage(kind, text) {
@@ -2077,6 +2451,7 @@ HTML = r"""<!doctype html>
       finalHeadingPoint = null;
       document.getElementById('headingDegInput').value = manualHeadingDeg.toFixed(1);
       setHeadingMode(false);
+      resetWorkflowRun('待执行');
       refreshMapUi();
       setPointMessage('ok', `已加入导航队列：${payload.name || 'Point'}，朝向 ${manualHeadingDeg.toFixed(1)}°`);
     }
@@ -2095,6 +2470,7 @@ HTML = r"""<!doctype html>
         updateReadouts(lastState);
         updateNavigationStatus(lastState);
       }
+      renderWorkflow();
     }
 
     function applyHeadingDegFromInput() {
@@ -2127,17 +2503,18 @@ HTML = r"""<!doctype html>
       return payload;
     }
 
-    async function startNavigation() {
+    async function startNavigation(options = {}) {
       if (!selectedWaypoints.length) {
         showNavMessage('bad', '导航：<strong>请先在地图上点击选择至少一个航点</strong>');
-        return;
+        return { ok: false, error: 'no waypoints' };
       }
       const targetYaw = computeTargetYaw(lastState);
-      setNavButtonsBusy(true);
+      if (!options.fromWorkflow) setNavButtonsBusy(true);
       showNavMessage('', `导航：正在发送航点和目标角度给 Slamware... ${targetYaw ? targetYaw.yawDeg.toFixed(1) + '° ' + targetYaw.label : ''}`);
       try {
         const data = await postJson('/api/navigation/start', buildNavigationPayload());
         if (data.ok) {
+          beginWorkflowRun(options.workflowMode || 'navigation');
           const warnings = data.command?.safety?.warnings || [];
           const warningText = warnings.length ? `，警告：${warnings.join('；')}` : '';
           const yawText = data.command?.yaw_deg !== null && data.command?.yaw_deg !== undefined
@@ -2148,12 +2525,68 @@ HTML = r"""<!doctype html>
           const blockers = data.safety?.blockers || [];
           const details = blockers.length ? `：${blockers.join('；')}` : (data.error || 'unknown error');
           showNavMessage('bad', `导航：<strong>启动失败</strong>${details}`);
+          if (!options.fromWorkflow) markWorkflowError(details);
         }
+        return data;
       } catch (err) {
         showNavMessage('bad', `导航：<strong>请求失败</strong> ${err}`);
+        if (!options.fromWorkflow) markWorkflowError(String(err));
+        return { ok: false, error: String(err) };
       } finally {
-        setNavButtonsBusy(false);
+        if (!options.fromWorkflow) {
+          setNavButtonsBusy(false);
+          if (workflowRun.running) setWorkflowRunningUi(true);
+        }
         tick();
+      }
+    }
+
+    async function runWorkflow() {
+      if (!selectedWaypoints.length) {
+        showNavMessage('bad', '动作链：<strong>请先添加至少一个导航点</strong>');
+        return;
+      }
+      addFakePickModule();
+      setWorkflowRunningUi(true);
+      showNavMessage('', '动作链：正在发送导航任务...');
+      const navData = await startNavigation({ fromWorkflow: true, workflowMode: 'chain' });
+      if (!navData.ok) {
+        markWorkflowError(navData.error || '导航启动失败');
+        showNavMessage('bad', `动作链：<strong>导航启动失败</strong> ${navData.error || ''}`);
+        return;
+      }
+      try {
+        showNavMessage('', '动作链：导航已开始，正在等待到达最后一个航点...');
+        await waitForFinalWaypoint();
+        selectedWaypoints.forEach((_point, index) => {
+          workflowRun.completed[waypointModuleId(index)] = true;
+        });
+        const fakeIndex = selectedWaypoints.length;
+        const fakeModule = extraActionModules.find(module => module.type === 'fake_pick_xiongmao');
+        if (fakeModule) {
+          workflowRun.currentIndex = fakeIndex;
+          workflowRun.actionStartedAt = Date.now();
+          workflowRun.actionDurationSec = fakeModule.durationSec || 5;
+          renderWorkflow();
+          showNavMessage('', '动作链：正在执行假动作“拾取熊猫烟”（5 秒）...');
+          const actionData = await postJson('/api/actions/execute', {
+            type: 'fake_pick_xiongmao',
+            name: '拾取熊猫烟',
+            duration_sec: fakeModule.durationSec || 5
+          });
+          if (!actionData.ok) {
+            throw new Error(actionData.error || '假动作执行失败');
+          }
+          workflowRun.completed[fakeModule.id] = true;
+        }
+        workflowRun.running = false;
+        workflowRun.note = '动作链完成';
+        setWorkflowRunningUi(false);
+        renderWorkflow();
+        showNavMessage('', '动作链：<strong>已完成</strong>');
+      } catch (err) {
+        markWorkflowError(String(err.message || err));
+        showNavMessage('bad', `动作链：<strong>执行失败</strong> ${err.message || err}`);
       }
     }
 
@@ -2164,6 +2597,10 @@ HTML = r"""<!doctype html>
         const data = await postJson('/api/navigation/cancel', {});
         if (data.ok) showNavMessage('', '导航：<strong>已发送停止指令</strong>');
         else showNavMessage('bad', `导航：<strong>停止失败</strong> ${data.error || ''}`);
+        workflowRun.running = false;
+        workflowRun.note = '已停止';
+        setWorkflowRunningUi(false);
+        renderWorkflow();
       } catch (err) {
         showNavMessage('bad', `导航：<strong>停止请求失败</strong> ${err}`);
       } finally {
@@ -2174,6 +2611,10 @@ HTML = r"""<!doctype html>
 
     mapCanvas.addEventListener('click', ev => {
       if (!lastState?.map || !currentMapGeom) return;
+      if (workflowRun.running) {
+        showNavMessage('bad', '动作链执行中：<strong>请先停止后再修改导航点</strong>');
+        return;
+      }
       const c = eventToCanvas(mapCanvas, ev);
       const p = canvasToMap(lastState.map, c.x, c.y, currentMapGeom);
       if (!p) {
@@ -2199,6 +2640,7 @@ HTML = r"""<!doctype html>
       finalHeadingPoint = null;
       manualHeadingDeg = null;
       document.getElementById('headingDegInput').value = '';
+      resetWorkflowRun('待执行');
       refreshMapUi();
     });
 
@@ -2208,6 +2650,7 @@ HTML = r"""<!doctype html>
       manualHeadingDeg = null;
       document.getElementById('headingDegInput').value = '';
       if (!selectedWaypoints.length) setHeadingMode(false);
+      resetWorkflowRun('待执行');
       refreshMapUi();
     });
     document.getElementById('clearWaypointsBtn').addEventListener('click', () => {
@@ -2216,6 +2659,7 @@ HTML = r"""<!doctype html>
       manualHeadingDeg = null;
       document.getElementById('headingDegInput').value = '';
       setHeadingMode(false);
+      resetWorkflowRun('待执行');
       refreshMapUi();
     });
     document.getElementById('setHeadingBtn').addEventListener('click', () => {
@@ -2237,7 +2681,10 @@ HTML = r"""<!doctype html>
       if (ev.key === 'Enter') applyHeadingDegFromInput();
     });
     document.getElementById('startNavigationBtn').addEventListener('click', startNavigation);
+    document.getElementById('runWorkflowBtn').addEventListener('click', runWorkflow);
     document.getElementById('stopNavigationBtn').addEventListener('click', stopNavigation);
+    document.getElementById('addFakePickBtn').addEventListener('click', addFakePickModule);
+    document.getElementById('resetWorkflowBtn').addEventListener('click', () => resetWorkflowRun('待执行'));
     document.getElementById('recordCurrentPointBtn').addEventListener('click', recordCurrentPoint);
     document.getElementById('newPointBtn').addEventListener('click', clearPointForm);
     document.getElementById('savePointBtn').addEventListener('click', savePoint);
@@ -2262,6 +2709,7 @@ HTML = r"""<!doctype html>
 
     window.addEventListener('resize', () => { cachedMapSeq = -1; tick(); });
     setInterval(tick, 500);
+    renderWorkflow();
     loadSavedPoints();
     tick();
   </script>
@@ -2334,15 +2782,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = self.read_json_body()
             if payload is None:
                 return
-            self.write_json(
-                {
-                    "ok": False,
-                    "error": "action execution is reserved but not implemented",
-                    "received": payload,
-                }
-            )
+            self.write_json(self.execute_action(payload))
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
+
+    def execute_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        action_type = str(payload.get("type") or payload.get("action") or "").strip()
+        if action_type != "fake_pick_xiongmao":
+            return {
+                "ok": False,
+                "error": "unsupported action type; only fake_pick_xiongmao is implemented",
+                "received": payload,
+            }
+        duration = finite_or_none(payload.get("duration_sec", 5), 3)
+        if duration is None:
+            duration = 5.0
+        duration = max(0.0, min(30.0, float(duration)))
+        started_at = now_iso()
+        time.sleep(duration)
+        return {
+            "ok": True,
+            "type": action_type,
+            "name": payload.get("name") or "拾取熊猫烟",
+            "started_at": started_at,
+            "finished_at": now_iso(),
+            "duration_sec": duration,
+            "simulated": True,
+            "message": "fake action finished; replace this endpoint with arm control later",
+        }
 
     def read_json_body(self) -> Optional[Dict[str, Any]]:
         try:

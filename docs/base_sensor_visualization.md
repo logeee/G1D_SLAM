@@ -210,3 +210,22 @@ curl -s -X POST http://127.0.0.1:18083/api/points/delete \
   -H 'Content-Type: application/json' \
   -d '{"id":"pt_xxx"}'
 ```
+
+## 动作链
+
+`SLAM Map + Odometry` 右侧是动作链面板：
+
+- 地图上点击添加的每个导航点，会自动显示为 `导航点 N`。
+- `开始导航` 只执行 Slamware 导航，同时右侧会显示当前导航进度。
+- `执行动作链` 会先执行导航，等机器人到达最后一个导航点附近后，再执行后续动作模块。
+- 当前预置的后续动作是 `拾取熊猫烟`，它只是一个假动作，后端会休眠 5 秒后返回成功。
+
+假动作接口：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"fake_pick_xiongmao","name":"拾取熊猫烟","duration_sec":5}'
+```
+
+后续接机械臂时，可以保留同一个动作链 UI，把 `fake_pick_xiongmao` 替换成真实动作类型，或者在 `/api/actions/execute` 里根据 `type` 分发到机械臂 SDK。

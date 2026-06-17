@@ -146,6 +146,15 @@ curl -s -X POST http://127.0.0.1:18083/api/navigation/cancel -d '{}'
 
 默认保存文件是 `data/nav_points.json`，启动时可用 `--points-file` 改路径。
 
+## 动作链
+
+`SLAM Map + Odometry` 右侧会显示当前动作链：
+
+- 地图上添加的每个导航点会显示为一个 `导航点 N` 模块。
+- 默认预留一个假模块 `拾取熊猫烟`，执行时后端会休眠 5 秒再返回。
+- `开始导航` 只执行导航，但右侧会显示导航进度。
+- `执行动作链` 会先导航到最后一个点附近，再执行 `拾取熊猫烟` 假动作。
+
 点位 API：
 
 ```bash
@@ -158,4 +167,12 @@ curl -s -X POST http://127.0.0.1:18083/api/points/record_current \
 curl -s -X POST http://127.0.0.1:18083/api/points/upsert \
   -H 'Content-Type: application/json' \
   -d '{"name":"手动点","x":1.2,"y":0.8,"yaw_deg":90,"actions":[]}'
+```
+
+假动作 API：
+
+```bash
+curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"fake_pick_xiongmao","name":"拾取熊猫烟","duration_sec":5}'
 ```
