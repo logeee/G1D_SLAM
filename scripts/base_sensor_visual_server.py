@@ -356,6 +356,7 @@ class BaseSensorNode(Node):
         arm_command_topic: str,
         arm_status_topic: str,
         arm_task_timeout_sec: float,
+        arm_stop_phases: Iterable[str],
         min_localization_quality: int,
         max_cloud_points: int,
     ) -> None:
@@ -366,6 +367,9 @@ class BaseSensorNode(Node):
         self.arm_command_topic = arm_command_topic
         self.arm_status_topic = arm_status_topic
         self.arm_task_timeout_sec = max(1.0, float(arm_task_timeout_sec))
+        self.arm_stop_phases = [str(phase).strip().upper() for phase in arm_stop_phases if str(phase).strip()]
+        if not self.arm_stop_phases:
+            self.arm_stop_phases = ["RESET"]
         self.arm_status_condition = threading.Condition()
         self.arm_status_by_task_id: Dict[str, List[Dict[str, Any]]] = {}
         qos = make_reliable_qos(depth=10)
@@ -734,6 +738,78 @@ class BaseSensorNode(Node):
             "timeout_sec": timeout,
             "started_at": started_at,
             "finished_at": now_iso(),
+        }
+
+    def publish_arm_command(
+        self,
+        phase: str,
+        target_object: str = "",
+        task_id: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        phase = str(phase or "").strip().upper()
+        if not phase:
+            return {"ok": False, "error": "empty arm phase"}
+        target_object = str(target_object or "").strip()
+        if not task_id:
+            task_id = f"arm_{phase.lower()}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        command = {
+            "task_id": task_id,
+            "phase": phase,
+            "target_object": target_object,
+        }
+        command_meta = {
+            "received_at": time.time(),
+            "task_id": task_id,
+            "phase": phase,
+            "target_object": target_object,
+            "published_topic": self.arm_command_topic,
+            "status_topic": self.arm_status_topic,
+            "dry_run": dry_run,
+            "command": command,
+        }
+        with self.state.lock:
+            self.state.seq["arm_task_command"] += 1
+            command_meta["seq"] = self.state.seq["arm_task_command"]
+            self.state.last_arm_task_command = command_meta
+        if not dry_run:
+            msg = String()
+            msg.data = json.dumps(command, ensure_ascii=False)
+            self.arm_task_command_pub.publish(msg)
+        return {"ok": True, "dry_run": dry_run, "command": command_meta}
+
+    def stop_all_actions(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        dry_run = bool(payload.get("dry_run") or payload.get("dryRun"))
+        if dry_run:
+            navigation = {
+                "ok": True,
+                "dry_run": True,
+                "navigation_cancelled": False,
+                "command": {
+                    "type": "cancel_action",
+                    "published_topic": "/slamware_ros_sdk_server_node/cancel_action",
+                },
+            }
+        else:
+            navigation = self.cancel_navigation()
+        raw_phases = payload.get("arm_stop_phases", payload.get("armStopPhases", self.arm_stop_phases))
+        if isinstance(raw_phases, str):
+            phases = [item.strip().upper() for item in raw_phases.split(",") if item.strip()]
+        elif isinstance(raw_phases, list):
+            phases = [str(item).strip().upper() for item in raw_phases if str(item).strip()]
+        else:
+            phases = list(self.arm_stop_phases)
+        if not phases:
+            phases = ["RESET"]
+        arm_commands = [self.publish_arm_command(phase, dry_run=dry_run) for phase in phases]
+        return {
+            "ok": bool(navigation.get("ok")) and all(item.get("ok") for item in arm_commands),
+            "dry_run": dry_run,
+            "navigation": navigation,
+            "arm_stop_phases": phases,
+            "arm_commands": arm_commands,
+            "message": "published navigation cancel and arm stop/reset commands",
         }
 
     def start_navigation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1790,6 +1866,9 @@ HTML = r"""<!doctype html>
     let cloudPitch = 0.65;
     let cloudDragging = false;
     let cloudLast = { x: 0, y: 0 };
+    const NAV_REACH_DISTANCE_M = 0.18;
+    const NAV_REACH_YAW_DEG = 4.0;
+    const NAV_REACH_STABLE_MS = 1200;
 
     function resizeCanvas(canvas) {
       const rect = canvas.getBoundingClientRect();
@@ -2527,9 +2606,28 @@ HTML = r"""<!doctype html>
       return Math.hypot(Number(state.odom.x) - Number(action.x), Number(state.odom.y) - Number(action.y));
     }
 
-    function isActionReached(action, state = lastState) {
+    function angleDiffDeg(aDeg, bDeg) {
+      if (!Number.isFinite(Number(aDeg)) || !Number.isFinite(Number(bDeg))) return null;
+      return Math.abs(normalizeAngle((Number(aDeg) - Number(bDeg)) * Math.PI / 180) * 180 / Math.PI);
+    }
+
+    function navigationReachState(action, state = lastState) {
       const dist = distanceToAction(action, state);
-      return dist !== null && dist <= 0.18;
+      const distanceOk = dist !== null && dist <= NAV_REACH_DISTANCE_M;
+      const hasTargetYaw = Number.isFinite(Number(action?.yawDeg));
+      const yawErrorDeg = hasTargetYaw ? angleDiffDeg(state?.odom?.yaw_deg, action.yawDeg) : null;
+      const yawOk = hasTargetYaw ? yawErrorDeg !== null && yawErrorDeg <= NAV_REACH_YAW_DEG : true;
+      return {
+        reached: Boolean(distanceOk && yawOk),
+        distanceOk,
+        yawOk,
+        dist,
+        yawErrorDeg,
+      };
+    }
+
+    function isActionReached(action, state = lastState) {
+      return navigationReachState(action, state).reached;
     }
 
     function previousNavigationPose(actionIndex) {
@@ -2727,12 +2825,22 @@ HTML = r"""<!doctype html>
 
     async function waitForActionReached(action, timeoutMs = 180000) {
       const started = Date.now();
+      let stableSince = null;
+      let lastReach = null;
       while (workflowRun.running && Date.now() - started < timeoutMs) {
-        if (isActionReached(action, lastState)) return true;
-        await sleepMs(500);
+        lastReach = navigationReachState(action, lastState);
+        if (lastReach.reached) {
+          if (stableSince === null) stableSince = Date.now();
+          if (Date.now() - stableSince >= NAV_REACH_STABLE_MS) return true;
+        } else {
+          stableSince = null;
+        }
+        await sleepMs(250);
       }
       if (!workflowRun.running) throw new Error('动作链已停止');
-      throw new Error('等待导航到达超时');
+      const distText = lastReach?.dist === null || lastReach?.dist === undefined ? '--' : `${(lastReach.dist * 1000).toFixed(0)}mm`;
+      const yawText = lastReach?.yawErrorDeg === null || lastReach?.yawErrorDeg === undefined ? '--' : `${lastReach.yawErrorDeg.toFixed(1)}°`;
+      throw new Error(`等待导航到达超时：距离偏差 ${distText}，yaw 偏差 ${yawText}`);
     }
 
     function setPointMessage(kind, text) {
@@ -3234,11 +3342,15 @@ HTML = r"""<!doctype html>
 
     async function stopNavigation() {
       setNavButtonsBusy(true);
-      showNavMessage('', '导航：正在发送停止指令...');
+      showNavMessage('', '停止：正在取消底盘导航，并发送机械臂停止/复位指令...');
       try {
-        const data = await postJson('/api/navigation/cancel', {});
-        if (data.ok) showNavMessage('', '导航：<strong>已发送停止指令</strong>');
-        else showNavMessage('bad', `导航：<strong>停止失败</strong> ${data.error || ''}`);
+        const data = await postJson('/api/actions/stop_all', {});
+        if (data.ok) {
+          const phases = Array.isArray(data.arm_stop_phases) ? data.arm_stop_phases.join(' / ') : '--';
+          showNavMessage('', `停止：<strong>已发送</strong> 底盘取消 + 机械臂 ${phases}`);
+        } else {
+          showNavMessage('bad', `停止：<strong>失败</strong> ${data.error || ''}`);
+        }
         workflowRun.running = false;
         workflowRun.note = '已停止';
         setWorkflowRunningUi(false);
@@ -3437,6 +3549,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             self.write_json(self.point_store.delete(payload))
+        elif parsed.path in ("/api/actions/stop_all", "/api/actions/stop"):
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.stop_all_actions(payload))
         elif parsed.path == "/api/actions/execute":
             payload = self.read_json_body()
             if payload is None:
@@ -3531,6 +3648,11 @@ def main() -> int:
     parser.add_argument("--arm-command-topic", default="/arm_control/task_command")
     parser.add_argument("--arm-status-topic", default="/arm_control/task_status")
     parser.add_argument("--arm-task-timeout-sec", type=float, default=120.0)
+    parser.add_argument(
+        "--arm-stop-phases",
+        default="RESET,SUCTION_STOP,MOTION_STOP",
+        help="Comma-separated arm phases published by the Stop button.",
+    )
     parser.add_argument("--points-file", default="data/nav_points.json")
     parser.add_argument(
         "--min-localization-quality",
@@ -3560,6 +3682,7 @@ def main() -> int:
         arm_command_topic=args.arm_command_topic,
         arm_status_topic=args.arm_status_topic,
         arm_task_timeout_sec=args.arm_task_timeout_sec,
+        arm_stop_phases=args.arm_stop_phases.split(","),
         min_localization_quality=args.min_localization_quality,
         max_cloud_points=args.max_cloud_points,
     )

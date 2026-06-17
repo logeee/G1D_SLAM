@@ -158,8 +158,9 @@ curl -s -X POST http://127.0.0.1:18083/api/navigation/cancel -d '{}'
 - `机械臂放置` / `机械臂复位` 会发布 `PLACE` / `RESET`，`target_object` 留空。
 - 动作卡片支持拖拽排序，也可以单独删除。
 - `清空动作` 会清空整个动作链，包括导航动作和机械臂动作。
-- `执行动作链` 会按卡片顺序逐个执行：导航动作先到位，其他动作再执行。
+- `执行动作链` 会按卡片顺序逐个执行：导航动作先到位，其他动作再执行。导航动作完成条件是距离目标点 180mm 内、目标 yaw 偏差 4 度内，并连续稳定约 1.2 秒。
 - `仅执行导航` 只用于调试导航，会跳过非导航动作。
+- `停止` 会取消 Slamware 导航，并向机械臂发布停止/复位 phase。默认发布 `RESET`、`SUCTION_STOP`、`MOTION_STOP`，可用 `--arm-stop-phases` 调整。
 - 机械臂任务会等待 `/arm_control/task_status` 中同一个 `task_id` 的终态：`DONE` 成功，`FAILED` / `REJECTED` 失败，默认超时 120 秒。
 
 点位 API：
