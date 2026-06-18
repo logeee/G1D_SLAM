@@ -1066,15 +1066,57 @@ class BaseSensorNode(Node):
             "published_topic": "/cmd_vel",
             "safety": safety,
         }
+        terminal_statuses = {"done", "dry_run", "timeout", "cancelled", "error"}
+
+        def record_command() -> None:
+            with self.state.lock:
+                self.state.seq["navigation_command"] += 1
+                command["seq"] = self.state.seq["navigation_command"]
+                self.state.last_navigation_command = command
+
         with self.state.lock:
-            self.state.seq["navigation_command"] += 1
-            command["seq"] = self.state.seq["navigation_command"]
-            self.state.last_navigation_command = command
+            previous_command = dict(self.state.last_navigation_command) if self.state.last_navigation_command else None
         if dry_run:
+            record_command()
             return {"ok": True, "navigation_started": False, "dry_run": True, "command": command}
+
+        active_thread = None
+        active_id = None
+        with self.raw_nav_lock:
+            active_thread = self.raw_nav_thread
+            active_id = self.raw_nav_id
+        if active_thread and active_thread.is_alive():
+            active_status = ""
+            if previous_command and previous_command.get("raw_nav_id") == active_id:
+                active_status = str(previous_command.get("raw_nav_status") or "")
+            if active_status in terminal_statuses:
+                active_thread.join(timeout=1.0)
+                with self.raw_nav_lock:
+                    if self.raw_nav_thread is active_thread and not active_thread.is_alive():
+                        self.raw_nav_thread = None
+                        if self.raw_nav_id == active_id:
+                            self.raw_nav_id = None
+            if active_thread.is_alive():
+                return {
+                    "ok": False,
+                    "error": "raw cmd_vel navigation is already running",
+                    "active_raw_nav": {
+                        "raw_nav_id": active_id,
+                        "raw_nav_status": active_status or None,
+                    },
+                    "command": command,
+                }
+
         with self.raw_nav_lock:
             if self.raw_nav_thread and self.raw_nav_thread.is_alive():
-                return {"ok": False, "error": "raw cmd_vel navigation is already running", "command": command}
+                return {
+                    "ok": False,
+                    "error": "raw cmd_vel navigation is already running",
+                    "active_raw_nav": {
+                        "raw_nav_id": self.raw_nav_id,
+                    },
+                    "command": command,
+                }
             self.raw_nav_stop.clear()
             self.raw_nav_id = nav_id
             self.raw_nav_thread = threading.Thread(
@@ -1083,6 +1125,7 @@ class BaseSensorNode(Node):
                 name="raw_cmd_vel_navigation",
                 daemon=True,
             )
+            record_command()
             self.raw_nav_thread.start()
         return {"ok": True, "navigation_started": True, "dry_run": False, "command": command}
 
