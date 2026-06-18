@@ -1331,8 +1331,20 @@ class BaseSensorNode(Node):
         if sensors:
             hit_sensors = [item for item in sensors.get("items", []) if item.get("is_in_impact")]
             if hit_sensors:
-                ids = ", ".join(str(item.get("id")) for item in hit_sensors)
-                blockers.append(f"bumper/sonar impact active: {ids}")
+                blocking_hits = [
+                    item for item in hit_sensors
+                    if int(item.get("sensor_type", -1)) != 2
+                ]
+                sonar_hits = [
+                    item for item in hit_sensors
+                    if int(item.get("sensor_type", -1)) == 2
+                ]
+                if blocking_hits:
+                    ids = ", ".join(str(item.get("id")) for item in blocking_hits)
+                    blockers.append(f"contact sensor impact active: {ids}")
+                if sonar_hits:
+                    ids = ", ".join(str(item.get("id")) for item in sonar_hits)
+                    warnings.append(f"sonar impact ignored for navigation start: {ids}")
 
         if robot_basic_state:
             if not robot_basic_state.get("is_localization_enabled"):
