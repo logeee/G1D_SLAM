@@ -2231,6 +2231,11 @@ HTML = r"""<!doctype html>
     const NAV_REACH_DISTANCE_M = 0.18;
     const NAV_REACH_YAW_DEG = 4.0;
     const NAV_REACH_STABLE_MS = 1200;
+    const NAV_IDLE_ACCEPT_DISTANCE_M = 0.22;
+    const NAV_IDLE_ACCEPT_YAW_DEG = 12.0;
+    const NAV_IDLE_STABLE_MS = 1800;
+    const NAV_ODOM_STILL_M = 0.008;
+    const NAV_ODOM_STILL_YAW_DEG = 0.8;
 
     function resizeCanvas(canvas) {
       const rect = canvas.getBoundingClientRect();
@@ -3241,6 +3246,82 @@ HTML = r"""<!doctype html>
       throw new Error(`等待导航到达超时：距离偏差 ${distText}，yaw 偏差 ${yawText}`);
     }
 
+    async function waitForSlamwareNavigationComplete(action, timeoutMs = 180000) {
+      const started = Date.now();
+      let strictStableSince = null;
+      let planIdleSince = null;
+      let odomStillSince = null;
+      let lastReach = null;
+      let lastOdom = null;
+      let lastStateError = null;
+      let sawNavigationEvidence = false;
+      while (workflowRun.running && Date.now() - started < timeoutMs) {
+        let state;
+        try {
+          state = await fetchStateOnce();
+        } catch (err) {
+          lastStateError = err;
+          await sleepMs(300);
+          continue;
+        }
+
+        const now = Date.now();
+        lastReach = navigationReachState(action, state);
+        if (lastReach.reached) {
+          if (strictStableSince === null) strictStableSince = now;
+          if (now - strictStableSince >= NAV_REACH_STABLE_MS) return true;
+        } else {
+          strictStableSince = null;
+        }
+
+        const plan = state?.navigation?.global_plan_path;
+        const planCount = Number(plan?.total_poses || 0);
+        const planFresh = Number(state?.freshness_s?.global_plan_path);
+        const planFreshOk = !Number.isFinite(planFresh) || planFresh <= 2.0;
+        if (planCount > 0) sawNavigationEvidence = true;
+        if (plan && planFreshOk && planCount === 0) {
+          if (planIdleSince === null) planIdleSince = now;
+        } else {
+          planIdleSince = null;
+        }
+
+        const odom = state?.odom;
+        if (odom && lastOdom) {
+          const moved = Math.hypot(Number(odom.x) - Number(lastOdom.x), Number(odom.y) - Number(lastOdom.y));
+          const yawMoved = angleDiffDeg(odom.yaw_deg, lastOdom.yaw_deg);
+          if (moved > 0.015 || (yawMoved !== null && yawMoved > 1.5)) sawNavigationEvidence = true;
+          if (moved <= NAV_ODOM_STILL_M && (yawMoved === null || yawMoved <= NAV_ODOM_STILL_YAW_DEG)) {
+            if (odomStillSince === null) odomStillSince = now;
+          } else {
+            odomStillSince = null;
+          }
+        }
+        if (odom) lastOdom = { x: Number(odom.x), y: Number(odom.y), yaw_deg: Number(odom.yaw_deg) };
+
+        const hasTargetYaw = Number.isFinite(Number(action?.yawDeg));
+        const idleDistanceOk = lastReach?.dist !== null && lastReach?.dist !== undefined && lastReach.dist <= NAV_IDLE_ACCEPT_DISTANCE_M;
+        const idleYawOk = hasTargetYaw
+          ? lastReach?.yawErrorDeg !== null && lastReach?.yawErrorDeg !== undefined && lastReach.yawErrorDeg <= NAV_IDLE_ACCEPT_YAW_DEG
+          : true;
+        const planIdleOk = planIdleSince !== null && now - planIdleSince >= NAV_IDLE_STABLE_MS;
+        const odomStillOk = odomStillSince !== null && now - odomStillSince >= NAV_IDLE_STABLE_MS;
+        if (planIdleOk && odomStillOk && idleDistanceOk && idleYawOk && (sawNavigationEvidence || now - started > 3000)) {
+          if (!lastReach.reached) {
+            const distText = `${(lastReach.dist * 1000).toFixed(0)}mm`;
+            const yawText = lastReach.yawErrorDeg === null || lastReach.yawErrorDeg === undefined ? '--' : `${lastReach.yawErrorDeg.toFixed(1)}°`;
+            showNavMessage('warn', `动作链：底层导航已停止，按兜底条件继续；距离 ${distText}，yaw ${yawText}`);
+          }
+          return true;
+        }
+        await sleepMs(250);
+      }
+      if (!workflowRun.running) throw new Error('动作链已停止');
+      if (lastStateError && !lastReach) throw new Error(`读取底盘状态失败：${lastStateError.message || lastStateError}`);
+      const distText = lastReach?.dist === null || lastReach?.dist === undefined ? '--' : `${(lastReach.dist * 1000).toFixed(0)}mm`;
+      const yawText = lastReach?.yawErrorDeg === null || lastReach?.yawErrorDeg === undefined ? '--' : `${lastReach.yawErrorDeg.toFixed(1)}°`;
+      throw new Error(`等待导航到达超时：距离偏差 ${distText}，yaw 偏差 ${yawText}`);
+    }
+
     async function waitForRawNavigationComplete(command, action, timeoutMs = 180000) {
       const rawNavId = command?.raw_nav_id;
       if (!rawNavId) return waitForActionReached(action, timeoutMs);
@@ -3771,7 +3852,7 @@ HTML = r"""<!doctype html>
             if (navData.command?.raw_cmd_vel && navData.command?.raw_nav_id) {
               await waitForRawNavigationComplete(navData.command, action);
             } else {
-              await waitForActionReached(action);
+              await waitForSlamwareNavigationComplete(action);
             }
             workflowRun.completed[action.id] = true;
             continue;
