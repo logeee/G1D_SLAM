@@ -26,7 +26,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import rclpy
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -352,6 +352,7 @@ class BaseSensorNode(Node):
         pointcloud_topics: Iterable[str],
         move_to_locations_topic: str,
         cancel_action_topic: str,
+        cmd_vel_topic: str,
         global_plan_path_topic: str,
         robot_basic_state_topic: str,
         slamware_state_topic: str,
@@ -366,6 +367,10 @@ class BaseSensorNode(Node):
         column_height_timeout_sec: float,
         column_height_min_m: float,
         column_height_max_m: float,
+        raw_nav_linear_speed_mps: float,
+        raw_nav_angular_speed_radps: float,
+        raw_nav_position_tolerance_m: float,
+        raw_nav_yaw_tolerance_deg: float,
         min_localization_quality: int,
         max_cloud_points: int,
     ) -> None:
@@ -386,6 +391,14 @@ class BaseSensorNode(Node):
         self.column_height_timeout_sec = max(1.0, float(column_height_timeout_sec))
         self.column_height_min_m = float(column_height_min_m)
         self.column_height_max_m = float(column_height_max_m)
+        self.raw_nav_linear_speed_mps = max(0.02, min(0.35, float(raw_nav_linear_speed_mps)))
+        self.raw_nav_angular_speed_radps = max(0.05, min(1.2, float(raw_nav_angular_speed_radps)))
+        self.raw_nav_position_tolerance_m = max(0.03, min(0.3, float(raw_nav_position_tolerance_m)))
+        self.raw_nav_yaw_tolerance_rad = math.radians(max(1.0, min(20.0, float(raw_nav_yaw_tolerance_deg))))
+        self.raw_nav_lock = threading.Lock()
+        self.raw_nav_stop = threading.Event()
+        self.raw_nav_thread: Optional[threading.Thread] = None
+        self.raw_nav_id: Optional[str] = None
         self.arm_status_condition = threading.Condition()
         self.arm_status_by_task_id: Dict[str, List[Dict[str, Any]]] = {}
         qos = make_reliable_qos(depth=10)
@@ -404,10 +417,12 @@ class BaseSensorNode(Node):
             self.create_subscription(PointCloud2, topic, self.make_point_cloud_cb(topic), qos)
         self.move_to_locations_pub = self.create_publisher(MoveToLocationsRequest, move_to_locations_topic, qos)
         self.cancel_action_pub = self.create_publisher(CancelActionRequest, cancel_action_topic, qos)
+        self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, qos)
         self.arm_task_command_pub = self.create_publisher(String, arm_command_topic, qos)
         self.get_logger().info(
             f"subscribed scan={scan_topic} map={map_topic} sensors={sensors_topic} "
-            f"pointclouds={pointcloud_topics} plan={global_plan_path_topic} arm_status={arm_status_topic}"
+            f"pointclouds={pointcloud_topics} plan={global_plan_path_topic} "
+            f"cmd_vel={cmd_vel_topic} arm_status={arm_status_topic}"
         )
 
     def on_scan(self, msg: LaserScan) -> None:
@@ -942,11 +957,21 @@ class BaseSensorNode(Node):
         if safety["blockers"]:
             return {"ok": False, "error": "navigation safety check failed", "safety": safety}
 
-        request = MoveToLocationsRequest()
-        request.locations = [Point(x=p["x"], y=p["y"], z=0.0) for p in waypoints]
         yaw_result = self.resolve_navigation_yaw(payload, waypoints)
         if not yaw_result["ok"]:
             return yaw_result
+        raw_cmd_vel = bool(
+            payload.get("raw_cmd_vel")
+            or payload.get("rawCmdVel")
+            or payload.get("disable_obstacle_avoidance")
+            or payload.get("disableObstacleAvoidance")
+            or payload.get("navigation_mode") == "raw_cmd_vel_no_obstacle_avoidance"
+        )
+        if raw_cmd_vel:
+            return self.start_raw_cmd_vel_navigation(payload, waypoints, yaw_result, safety)
+
+        request = MoveToLocationsRequest()
+        request.locations = [Point(x=p["x"], y=p["y"], z=0.0) for p in waypoints]
         request.yaw = float(yaw_result["yaw"])
         request.options.opt_flags.flags = int(request.options.opt_flags.flags) | SLAMWARE_MOVE_OPTION_WITH_YAW
         direct_no_avoidance = bool(
@@ -996,19 +1021,193 @@ class BaseSensorNode(Node):
             self.state.last_navigation_command = command
         return {"ok": True, "navigation_started": not dry_run, "dry_run": dry_run, "command": command}
 
+    def start_raw_cmd_vel_navigation(
+        self,
+        payload: Dict[str, Any],
+        waypoints: List[Dict[str, float]],
+        yaw_result: Dict[str, Any],
+        safety: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        dry_run = bool(payload.get("dry_run"))
+        speed_ratio = finite_or_none(payload.get("speed_ratio", 1.0), 3)
+        if speed_ratio is None:
+            speed_ratio = 1.0
+        speed_ratio = max(0.2, min(1.0, float(speed_ratio)))
+        linear_speed = finite_or_none(payload.get("raw_linear_speed_mps", self.raw_nav_linear_speed_mps), 3)
+        angular_speed = finite_or_none(payload.get("raw_angular_speed_radps", self.raw_nav_angular_speed_radps), 3)
+        position_tolerance = finite_or_none(payload.get("raw_position_tolerance_m", self.raw_nav_position_tolerance_m), 3)
+        yaw_tolerance_deg = finite_or_none(payload.get("raw_yaw_tolerance_deg", math.degrees(self.raw_nav_yaw_tolerance_rad)), 2)
+        timeout = finite_or_none(payload.get("timeout_sec", payload.get("timeoutSec", max(30.0, 45.0 * len(waypoints)))), 2)
+        linear_speed = max(0.02, min(0.35, float(linear_speed or self.raw_nav_linear_speed_mps))) * speed_ratio
+        angular_speed = max(0.05, min(1.2, float(angular_speed or self.raw_nav_angular_speed_radps))) * speed_ratio
+        position_tolerance = max(0.03, min(0.3, float(position_tolerance or self.raw_nav_position_tolerance_m)))
+        yaw_tolerance_rad = math.radians(max(1.0, min(20.0, float(yaw_tolerance_deg or math.degrees(self.raw_nav_yaw_tolerance_rad)))))
+        timeout = max(5.0, min(600.0, float(timeout or 60.0)))
+        nav_id = f"raw_nav_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        command = {
+            "received_at": time.time(),
+            "type": "raw_cmd_vel_navigation",
+            "dry_run": dry_run,
+            "navigation_started": not dry_run,
+            "waypoints": waypoints,
+            "yaw": finite_or_none(float(yaw_result["yaw"]), 5),
+            "yaw_deg": finite_or_none(math.degrees(float(yaw_result["yaw"])), 2),
+            "yaw_source": yaw_result["source"],
+            "navigation_mode": "raw_cmd_vel_no_obstacle_avoidance",
+            "disable_obstacle_avoidance": True,
+            "raw_cmd_vel": True,
+            "raw_nav_id": nav_id,
+            "raw_nav_status": "dry_run" if dry_run else "running",
+            "raw_linear_speed_mps": finite_or_none(linear_speed, 3),
+            "raw_angular_speed_radps": finite_or_none(angular_speed, 3),
+            "raw_position_tolerance_m": finite_or_none(position_tolerance, 3),
+            "raw_yaw_tolerance_deg": finite_or_none(math.degrees(yaw_tolerance_rad), 2),
+            "timeout_sec": finite_or_none(timeout, 2),
+            "published_topic": "/cmd_vel",
+            "safety": safety,
+        }
+        with self.state.lock:
+            self.state.seq["navigation_command"] += 1
+            command["seq"] = self.state.seq["navigation_command"]
+            self.state.last_navigation_command = command
+        if dry_run:
+            return {"ok": True, "navigation_started": False, "dry_run": True, "command": command}
+        with self.raw_nav_lock:
+            if self.raw_nav_thread and self.raw_nav_thread.is_alive():
+                return {"ok": False, "error": "raw cmd_vel navigation is already running", "command": command}
+            self.raw_nav_stop.clear()
+            self.raw_nav_id = nav_id
+            self.raw_nav_thread = threading.Thread(
+                target=self.raw_cmd_vel_worker,
+                args=(nav_id, waypoints, float(yaw_result["yaw"]), linear_speed, angular_speed, position_tolerance, yaw_tolerance_rad, timeout),
+                name="raw_cmd_vel_navigation",
+                daemon=True,
+            )
+            self.raw_nav_thread.start()
+        return {"ok": True, "navigation_started": True, "dry_run": False, "command": command}
+
+    @staticmethod
+    def clamp_abs(value: float, max_abs: float, min_abs: float = 0.0) -> float:
+        if abs(value) < min_abs:
+            return math.copysign(min_abs, value) if value else 0.0
+        return max(-max_abs, min(max_abs, value))
+
+    def publish_cmd_vel(self, linear_x: float = 0.0, angular_z: float = 0.0) -> None:
+        msg = Twist()
+        msg.linear.x = float(linear_x)
+        msg.angular.z = float(angular_z)
+        self.cmd_vel_pub.publish(msg)
+
+    def update_raw_nav_status(self, nav_id: str, **updates: Any) -> None:
+        with self.state.lock:
+            current = self.state.last_navigation_command
+            if current and current.get("raw_nav_id") == nav_id:
+                current.update(updates)
+
+    def get_current_odom(self) -> Optional[Dict[str, Any]]:
+        with self.state.lock:
+            return dict(self.state.odom) if self.state.odom else None
+
+    def raw_cmd_vel_worker(
+        self,
+        nav_id: str,
+        waypoints: List[Dict[str, float]],
+        final_yaw: float,
+        linear_speed: float,
+        angular_speed: float,
+        position_tolerance: float,
+        yaw_tolerance_rad: float,
+        timeout: float,
+    ) -> None:
+        started = time.time()
+        status = "done"
+        error = ""
+        try:
+            for idx, target in enumerate(waypoints):
+                self.update_raw_nav_status(nav_id, raw_nav_status="running", raw_nav_target_index=idx)
+                while not self.raw_nav_stop.is_set():
+                    if time.time() - started > timeout:
+                        status, error = "timeout", "raw cmd_vel navigation timeout"
+                        return
+                    odom = self.get_current_odom()
+                    if not odom or time.time() - float(odom.get("received_at", 0.0)) > 1.0:
+                        self.publish_cmd_vel(0.0, 0.0)
+                        time.sleep(0.1)
+                        continue
+                    dx = float(target["x"]) - float(odom["x"])
+                    dy = float(target["y"]) - float(odom["y"])
+                    dist = math.hypot(dx, dy)
+                    if dist <= position_tolerance:
+                        self.publish_cmd_vel(0.0, 0.0)
+                        break
+                    yaw = float(odom.get("yaw") or 0.0)
+                    target_yaw = math.atan2(dy, dx)
+                    yaw_err = normalize_angle_rad(target_yaw - yaw)
+                    if abs(yaw_err) > math.radians(25.0):
+                        linear = 0.0
+                    else:
+                        linear = min(linear_speed, max(0.03, dist * 0.45)) * max(0.25, math.cos(yaw_err))
+                    angular = self.clamp_abs(1.8 * yaw_err, angular_speed, min_abs=0.06)
+                    self.publish_cmd_vel(linear, angular)
+                    self.update_raw_nav_status(
+                        nav_id,
+                        raw_nav_status="running",
+                        raw_nav_distance_m=finite_or_none(dist, 3),
+                        raw_nav_heading_error_deg=finite_or_none(math.degrees(yaw_err), 1),
+                    )
+                    time.sleep(0.1)
+            while not self.raw_nav_stop.is_set():
+                if time.time() - started > timeout:
+                    status, error = "timeout", "raw cmd_vel navigation timeout"
+                    return
+                odom = self.get_current_odom()
+                if not odom or time.time() - float(odom.get("received_at", 0.0)) > 1.0:
+                    self.publish_cmd_vel(0.0, 0.0)
+                    time.sleep(0.1)
+                    continue
+                yaw_err = normalize_angle_rad(final_yaw - float(odom.get("yaw") or 0.0))
+                if abs(yaw_err) <= yaw_tolerance_rad:
+                    break
+                angular = self.clamp_abs(1.8 * yaw_err, angular_speed, min_abs=0.06)
+                self.publish_cmd_vel(0.0, angular)
+                self.update_raw_nav_status(
+                    nav_id,
+                    raw_nav_status="final_yaw",
+                    raw_nav_yaw_error_deg=finite_or_none(math.degrees(yaw_err), 1),
+                )
+                time.sleep(0.1)
+            if self.raw_nav_stop.is_set():
+                status, error = "cancelled", "raw cmd_vel navigation cancelled"
+        finally:
+            self.publish_cmd_vel(0.0, 0.0)
+            self.update_raw_nav_status(nav_id, raw_nav_status=status, raw_nav_error=error, raw_nav_finished_at=now_iso())
+            with self.raw_nav_lock:
+                if self.raw_nav_id == nav_id:
+                    self.raw_nav_id = None
+
     def cancel_navigation(self) -> Dict[str, Any]:
+        raw_cancelled = self.cancel_raw_cmd_vel_navigation()
         self.cancel_action_pub.publish(CancelActionRequest())
         now = time.time()
         command = {
             "received_at": now,
             "type": "cancel_action",
             "published_topic": "/slamware_ros_sdk_server_node/cancel_action",
+            "raw_cmd_vel_cancelled": raw_cancelled,
         }
         with self.state.lock:
             self.state.seq["navigation_command"] += 1
             command["seq"] = self.state.seq["navigation_command"]
             self.state.last_navigation_command = command
         return {"ok": True, "navigation_cancelled": True, "command": command}
+
+    def cancel_raw_cmd_vel_navigation(self) -> bool:
+        with self.raw_nav_lock:
+            running = bool(self.raw_nav_thread and self.raw_nav_thread.is_alive())
+            if running:
+                self.raw_nav_stop.set()
+        self.publish_cmd_vel(0.0, 0.0)
+        return running
 
     def parse_waypoints(self, raw: Any) -> Tuple[List[Dict[str, float]], List[str]]:
         errors = []
@@ -1824,6 +2023,10 @@ HTML = r"""<!doctype html>
           <input id="directNoAvoidanceMode" type="checkbox" />
           直连不绕障
         </label>
+        <label class="nav-mode-toggle" title="绕开 Slamware 导航，直接发布 /cmd_vel；不会自动避障，请只在确认路径安全时使用。">
+          <input id="rawCmdVelNoAvoidanceMode" type="checkbox" />
+          裸控无避障
+        </label>
         <span id="navHint" class="nav-hint">在地图上点击快速增加导航动作</span>
       </div>
       <div id="navStatus" class="nav-status">导航：等待选点</div>
@@ -2576,10 +2779,13 @@ HTML = r"""<!doctype html>
       const planCount = state.navigation?.global_plan_path?.total_poses || 0;
       const targetYaw = computeTargetYaw(state);
       const modeInput = document.getElementById('directNoAvoidanceMode');
-      const plannedMode = modeInput?.checked ? '直连不绕障' : '普通避障';
-      const lastMode = last?.navigation_mode === 'direct_key_points_stop_on_obstacle'
+      const rawModeInput = document.getElementById('rawCmdVelNoAvoidanceMode');
+      const plannedMode = rawModeInput?.checked ? '裸控无避障' : (modeInput?.checked ? '直连不绕障' : '普通避障');
+      const lastMode = last?.navigation_mode === 'raw_cmd_vel_no_obstacle_avoidance'
+        ? '裸控无避障'
+        : (last?.navigation_mode === 'direct_key_points_stop_on_obstacle'
         ? '直连不绕障'
-        : (last?.navigation_mode === 'normal_slamware' ? '普通避障' : '--');
+        : (last?.navigation_mode === 'normal_slamware' ? '普通避障' : '--'));
       const parts = [
         `<strong>${selectedWaypoints.length}</strong> 个航点`,
         `目标角度: <strong>${targetYaw ? targetYaw.yawDeg.toFixed(1) + '° ' + targetYaw.label : '--'}</strong>`,
@@ -2757,6 +2963,7 @@ HTML = r"""<!doctype html>
         'headingDegInput',
         'applyHeadingDegBtn',
         'directNoAvoidanceMode',
+        'rawCmdVelNoAvoidanceMode',
         'addPointToNavBtn',
         'newActionType',
         'newActionPointSelect',
@@ -3413,7 +3620,12 @@ HTML = r"""<!doctype html>
     function buildNavigationPayload(waypoints = selectedWaypoints, yawDeg = null, yawSource = 'workflow_action') {
       const payload = { waypoints };
       const directNoAvoidanceMode = Boolean(document.getElementById('directNoAvoidanceMode')?.checked);
-      if (directNoAvoidanceMode) {
+      const rawCmdVelNoAvoidanceMode = Boolean(document.getElementById('rawCmdVelNoAvoidanceMode')?.checked);
+      if (rawCmdVelNoAvoidanceMode) {
+        payload.raw_cmd_vel = true;
+        payload.disable_obstacle_avoidance = true;
+        payload.navigation_mode = 'raw_cmd_vel_no_obstacle_avoidance';
+      } else if (directNoAvoidanceMode) {
         payload.direct_no_avoidance = true;
         payload.navigation_mode = 'direct_key_points_stop_on_obstacle';
       }
@@ -3441,8 +3653,9 @@ HTML = r"""<!doctype html>
         : computeTargetYaw(lastState);
       if (!options.fromWorkflow) setNavButtonsBusy(true);
       const directNoAvoidanceMode = Boolean(document.getElementById('directNoAvoidanceMode')?.checked);
-      const modeText = directNoAvoidanceMode ? '直连不绕障（遇障停止）' : '普通避障';
-      showNavMessage('', `导航：正在发送航点和目标角度给 Slamware... ${targetYaw ? targetYaw.yawDeg.toFixed(1) + '° ' + targetYaw.label : ''}，模式 ${modeText}`);
+      const rawCmdVelNoAvoidanceMode = Boolean(document.getElementById('rawCmdVelNoAvoidanceMode')?.checked);
+      const modeText = rawCmdVelNoAvoidanceMode ? '裸控无避障（/cmd_vel）' : (directNoAvoidanceMode ? '直连不绕障（遇障停止）' : '普通避障');
+      showNavMessage('', `导航：正在发送航点和目标角度... ${targetYaw ? targetYaw.yawDeg.toFixed(1) + '° ' + targetYaw.label : ''}，模式 ${modeText}`);
       try {
         const data = await postJson('/api/navigation/start', buildNavigationPayload(waypoints, options.yawDeg, options.yawSource || 'workflow_action'));
         if (data.ok) {
@@ -3455,7 +3668,9 @@ HTML = r"""<!doctype html>
           const yawText = data.command?.yaw_deg !== null && data.command?.yaw_deg !== undefined
             ? `，目标角度 ${Number(data.command.yaw_deg).toFixed(1)}°`
             : '';
-          const commandModeText = data.command?.direct_no_avoidance ? '，直连不绕障（遇障停止）' : '，普通避障';
+          const commandModeText = data.command?.raw_cmd_vel
+            ? '，裸控无避障（/cmd_vel）'
+            : (data.command?.direct_no_avoidance ? '，直连不绕障（遇障停止）' : '，普通避障');
           showNavMessage(warnings.length ? 'warn' : '', `导航：<strong>已开始</strong>，航点 ${waypoints.length} 个${yawText}${commandModeText}${warningText}`);
         } else {
           const blockers = data.safety?.blockers || [];
@@ -3679,9 +3894,18 @@ HTML = r"""<!doctype html>
     });
     document.getElementById('directNoAvoidanceMode').addEventListener('change', () => {
       const enabled = Boolean(document.getElementById('directNoAvoidanceMode')?.checked);
+      if (enabled) document.getElementById('rawCmdVelNoAvoidanceMode').checked = false;
       showNavMessage(enabled ? 'warn' : '', enabled
         ? '导航：已启用 <strong>直连不绕障</strong>，Slamware 会按指定路径走，遇障停止。'
         : '导航：已切回 <strong>普通避障</strong>。');
+      tick();
+    });
+    document.getElementById('rawCmdVelNoAvoidanceMode').addEventListener('change', () => {
+      const enabled = Boolean(document.getElementById('rawCmdVelNoAvoidanceMode')?.checked);
+      if (enabled) document.getElementById('directNoAvoidanceMode').checked = false;
+      showNavMessage(enabled ? 'bad' : '', enabled
+        ? '导航：已启用 <strong>裸控无避障</strong>，将直接发布 /cmd_vel，请确认路径完全安全。'
+        : '导航：已关闭 <strong>裸控无避障</strong>。');
       tick();
     });
     document.getElementById('startNavigationBtn').addEventListener('click', startNavigation);
@@ -3883,6 +4107,7 @@ def main() -> int:
     parser.add_argument("--pointcloud-topic", action="append", default=["/ele_clouds"])
     parser.add_argument("--move-to-locations-topic", default="/slamware_ros_sdk_server_node/move_to_locations")
     parser.add_argument("--cancel-action-topic", default="/slamware_ros_sdk_server_node/cancel_action")
+    parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--global-plan-path-topic", default="/slamware_ros_sdk_server_node/global_plan_path")
     parser.add_argument("--robot-basic-state-topic", default="/slamware_ros_sdk_server_node/robot_basic_state")
     parser.add_argument("--slamware-state-topic", default="/slamware_ros_sdk_server_node/state")
@@ -3901,6 +4126,10 @@ def main() -> int:
     parser.add_argument("--column-height-timeout-sec", type=float, default=30.0)
     parser.add_argument("--column-height-min-m", type=float, default=-1.0)
     parser.add_argument("--column-height-max-m", type=float, default=1.0)
+    parser.add_argument("--raw-nav-linear-speed-mps", type=float, default=0.12)
+    parser.add_argument("--raw-nav-angular-speed-radps", type=float, default=0.45)
+    parser.add_argument("--raw-nav-position-tolerance-m", type=float, default=0.08)
+    parser.add_argument("--raw-nav-yaw-tolerance-deg", type=float, default=5.0)
     parser.add_argument("--points-file", default="data/nav_points.json")
     parser.add_argument(
         "--min-localization-quality",
@@ -3924,6 +4153,7 @@ def main() -> int:
         pointcloud_topics=args.pointcloud_topic,
         move_to_locations_topic=args.move_to_locations_topic,
         cancel_action_topic=args.cancel_action_topic,
+        cmd_vel_topic=args.cmd_vel_topic,
         global_plan_path_topic=args.global_plan_path_topic,
         robot_basic_state_topic=args.robot_basic_state_topic,
         slamware_state_topic=args.slamware_state_topic,
@@ -3938,6 +4168,10 @@ def main() -> int:
         column_height_timeout_sec=args.column_height_timeout_sec,
         column_height_min_m=args.column_height_min_m,
         column_height_max_m=args.column_height_max_m,
+        raw_nav_linear_speed_mps=args.raw_nav_linear_speed_mps,
+        raw_nav_angular_speed_radps=args.raw_nav_angular_speed_radps,
+        raw_nav_position_tolerance_m=args.raw_nav_position_tolerance_m,
+        raw_nav_yaw_tolerance_deg=args.raw_nav_yaw_tolerance_deg,
         min_localization_quality=args.min_localization_quality,
         max_cloud_points=args.max_cloud_points,
     )
