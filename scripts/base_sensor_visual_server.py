@@ -2875,6 +2875,16 @@ HTML = r"""<!doctype html>
       return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    async function fetchStateOnce() {
+      const res = await fetch('/api/state', { cache: 'no-store' });
+      const state = await res.json();
+      if (!res.ok || state?.ok === false) {
+        throw new Error(state?.error || 'state request failed');
+      }
+      lastState = state;
+      return state;
+    }
+
     function getWorkflowModules() {
       return workflowActions.map((action, index) => {
         if (action.type === 'navigate') {
@@ -3229,6 +3239,46 @@ HTML = r"""<!doctype html>
       const distText = lastReach?.dist === null || lastReach?.dist === undefined ? '--' : `${(lastReach.dist * 1000).toFixed(0)}mm`;
       const yawText = lastReach?.yawErrorDeg === null || lastReach?.yawErrorDeg === undefined ? '--' : `${lastReach.yawErrorDeg.toFixed(1)}°`;
       throw new Error(`等待导航到达超时：距离偏差 ${distText}，yaw 偏差 ${yawText}`);
+    }
+
+    async function waitForRawNavigationComplete(command, action, timeoutMs = 180000) {
+      const rawNavId = command?.raw_nav_id;
+      if (!rawNavId) return waitForActionReached(action, timeoutMs);
+      const started = Date.now();
+      let lastRawCommand = null;
+      let lastStateError = null;
+      while (workflowRun.running && Date.now() - started < timeoutMs) {
+        let state;
+        try {
+          state = await fetchStateOnce();
+        } catch (err) {
+          lastStateError = err;
+          await sleepMs(300);
+          continue;
+        }
+        const current = state?.navigation?.last_command;
+        if (current?.raw_nav_id === rawNavId) {
+          lastRawCommand = current;
+          const status = String(current.raw_nav_status || '');
+          if (status === 'done' || status === 'dry_run') return true;
+          if (status === 'timeout' || status === 'cancelled' || status === 'error') {
+            throw new Error(`裸控导航${status}：${current.raw_nav_error || 'no detail'}`);
+          }
+        } else if (current?.raw_cmd_vel && current?.raw_nav_id && current.raw_nav_id !== rawNavId) {
+          throw new Error('裸控导航被新的 /cmd_vel 导航请求替换');
+        }
+        await sleepMs(250);
+      }
+      if (!workflowRun.running) throw new Error('动作链已停止');
+      if (lastStateError && !lastRawCommand) throw new Error(`读取底盘状态失败：${lastStateError.message || lastStateError}`);
+      const statusText = lastRawCommand?.raw_nav_status || '--';
+      const distText = lastRawCommand?.raw_nav_distance_m === null || lastRawCommand?.raw_nav_distance_m === undefined
+        ? '--'
+        : `${(Number(lastRawCommand.raw_nav_distance_m) * 1000).toFixed(0)}mm`;
+      const yawText = lastRawCommand?.raw_nav_yaw_error_deg === null || lastRawCommand?.raw_nav_yaw_error_deg === undefined
+        ? '--'
+        : `${Number(lastRawCommand.raw_nav_yaw_error_deg).toFixed(1)}°`;
+      throw new Error(`等待裸控导航完成超时：status=${statusText}，距离 ${distText}，yaw ${yawText}`);
     }
 
     function setPointMessage(kind, text) {
@@ -3718,7 +3768,11 @@ HTML = r"""<!doctype html>
             if (!navData.ok) {
               throw new Error(navData.error || '导航启动失败');
             }
-            await waitForActionReached(action);
+            if (navData.command?.raw_cmd_vel && navData.command?.raw_nav_id) {
+              await waitForRawNavigationComplete(navData.command, action);
+            } else {
+              await waitForActionReached(action);
+            }
             workflowRun.completed[action.id] = true;
             continue;
           }
