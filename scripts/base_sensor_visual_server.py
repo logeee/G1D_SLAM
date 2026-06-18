@@ -57,6 +57,7 @@ IMPACT_TYPE_NAMES = {
 }
 
 SLAMWARE_MOVE_OPTION_WITH_YAW = 32
+SLAMWARE_MOVE_OPTION_KEY_POINTS = 8
 
 
 def finite_or_none(value: Any, digits: Optional[int] = None) -> Optional[float]:
@@ -948,6 +949,14 @@ class BaseSensorNode(Node):
             return yaw_result
         request.yaw = float(yaw_result["yaw"])
         request.options.opt_flags.flags = int(request.options.opt_flags.flags) | SLAMWARE_MOVE_OPTION_WITH_YAW
+        direct_no_avoidance = bool(
+            payload.get("direct_no_avoidance")
+            or payload.get("directNoAvoidance")
+            or payload.get("key_points_mode")
+            or payload.get("keyPointsMode")
+        )
+        if direct_no_avoidance:
+            request.options.opt_flags.flags = int(request.options.opt_flags.flags) | SLAMWARE_MOVE_OPTION_KEY_POINTS
 
         speed_ratio = payload.get("speed_ratio")
         if speed_ratio is not None:
@@ -970,6 +979,9 @@ class BaseSensorNode(Node):
             "yaw_source": yaw_result["source"],
             "move_option_flags": int(request.options.opt_flags.flags),
             "with_yaw": bool(int(request.options.opt_flags.flags) & SLAMWARE_MOVE_OPTION_WITH_YAW),
+            "direct_no_avoidance": direct_no_avoidance,
+            "key_points_mode": bool(int(request.options.opt_flags.flags) & SLAMWARE_MOVE_OPTION_KEY_POINTS),
+            "navigation_mode": "direct_key_points_stop_on_obstacle" if direct_no_avoidance else "normal_slamware",
             "speed_ratio": finite_or_none(request.options.speed_ratio.value, 3)
             if request.options.speed_ratio.is_valid
             else None,
@@ -1645,6 +1657,26 @@ HTML = r"""<!doctype html>
       font-size: 12px;
       margin-left: auto;
     }
+    .nav-mode-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 38px;
+      padding: 0 10px;
+      border: 1px solid #f59e0b;
+      border-radius: 6px;
+      background: #fffbeb;
+      color: #92400e;
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .nav-mode-toggle input {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+      accent-color: #d97706;
+    }
     .heading-input {
       width: 96px;
       border: 1px solid #b9c6d8;
@@ -1788,6 +1820,10 @@ HTML = r"""<!doctype html>
         <button id="clearHeadingBtn">清除朝向</button>
         <input id="headingDegInput" class="heading-input" type="number" step="1" min="-180" max="180" placeholder="角度°" />
         <button id="applyHeadingDegBtn">应用角度</button>
+        <label class="nav-mode-toggle" title="使用 Slamware KeyPoints 模式：按指定路径走，不自动绕障；遇到障碍会停止。">
+          <input id="directNoAvoidanceMode" type="checkbox" />
+          直连不绕障
+        </label>
         <span id="navHint" class="nav-hint">在地图上点击快速增加导航动作</span>
       </div>
       <div id="navStatus" class="nav-status">导航：等待选点</div>
@@ -2539,9 +2575,16 @@ HTML = r"""<!doctype html>
       const slamState = state.navigation?.slamware_state?.state || '--';
       const planCount = state.navigation?.global_plan_path?.total_poses || 0;
       const targetYaw = computeTargetYaw(state);
+      const modeInput = document.getElementById('directNoAvoidanceMode');
+      const plannedMode = modeInput?.checked ? '直连不绕障' : '普通避障';
+      const lastMode = last?.navigation_mode === 'direct_key_points_stop_on_obstacle'
+        ? '直连不绕障'
+        : (last?.navigation_mode === 'normal_slamware' ? '普通避障' : '--');
       const parts = [
         `<strong>${selectedWaypoints.length}</strong> 个航点`,
         `目标角度: <strong>${targetYaw ? targetYaw.yawDeg.toFixed(1) + '° ' + targetYaw.label : '--'}</strong>`,
+        `模式: <strong>${plannedMode}</strong>`,
+        `上次模式: <strong>${lastMode}</strong>`,
         `Slamware: <strong>${slamState}</strong>`,
         `定位: <strong>${basic ? (basic.is_localization_enabled ? 'ON' : 'OFF') + ' / ' + basic.localization_quality : '--'}</strong>`,
         `规划路径: <strong>${planCount}</strong> 点`
@@ -2713,6 +2756,7 @@ HTML = r"""<!doctype html>
         'clearHeadingBtn',
         'headingDegInput',
         'applyHeadingDegBtn',
+        'directNoAvoidanceMode',
         'addPointToNavBtn',
         'newActionType',
         'newActionPointSelect',
@@ -3368,6 +3412,11 @@ HTML = r"""<!doctype html>
 
     function buildNavigationPayload(waypoints = selectedWaypoints, yawDeg = null, yawSource = 'workflow_action') {
       const payload = { waypoints };
+      const directNoAvoidanceMode = Boolean(document.getElementById('directNoAvoidanceMode')?.checked);
+      if (directNoAvoidanceMode) {
+        payload.direct_no_avoidance = true;
+        payload.navigation_mode = 'direct_key_points_stop_on_obstacle';
+      }
       if (yawDeg !== null && yawDeg !== undefined && Number.isFinite(Number(yawDeg))) {
         payload.yaw = Number(normalizeAngle(Number(yawDeg) * Math.PI / 180).toFixed(6));
         payload.yaw_source = yawSource;
@@ -3391,7 +3440,9 @@ HTML = r"""<!doctype html>
         ? { yawDeg: Number(options.yawDeg), label: '动作' }
         : computeTargetYaw(lastState);
       if (!options.fromWorkflow) setNavButtonsBusy(true);
-      showNavMessage('', `导航：正在发送航点和目标角度给 Slamware... ${targetYaw ? targetYaw.yawDeg.toFixed(1) + '° ' + targetYaw.label : ''}`);
+      const directNoAvoidanceMode = Boolean(document.getElementById('directNoAvoidanceMode')?.checked);
+      const modeText = directNoAvoidanceMode ? '直连不绕障（遇障停止）' : '普通避障';
+      showNavMessage('', `导航：正在发送航点和目标角度给 Slamware... ${targetYaw ? targetYaw.yawDeg.toFixed(1) + '° ' + targetYaw.label : ''}，模式 ${modeText}`);
       try {
         const data = await postJson('/api/navigation/start', buildNavigationPayload(waypoints, options.yawDeg, options.yawSource || 'workflow_action'));
         if (data.ok) {
@@ -3404,7 +3455,8 @@ HTML = r"""<!doctype html>
           const yawText = data.command?.yaw_deg !== null && data.command?.yaw_deg !== undefined
             ? `，目标角度 ${Number(data.command.yaw_deg).toFixed(1)}°`
             : '';
-          showNavMessage(warnings.length ? 'warn' : '', `导航：<strong>已开始</strong>，航点 ${waypoints.length} 个${yawText}${warningText}`);
+          const commandModeText = data.command?.direct_no_avoidance ? '，直连不绕障（遇障停止）' : '，普通避障';
+          showNavMessage(warnings.length ? 'warn' : '', `导航：<strong>已开始</strong>，航点 ${waypoints.length} 个${yawText}${commandModeText}${warningText}`);
         } else {
           const blockers = data.safety?.blockers || [];
           const details = blockers.length ? `：${blockers.join('；')}` : (data.error || 'unknown error');
@@ -3624,6 +3676,13 @@ HTML = r"""<!doctype html>
     document.getElementById('applyHeadingDegBtn').addEventListener('click', applyHeadingDegFromInput);
     document.getElementById('headingDegInput').addEventListener('keydown', ev => {
       if (ev.key === 'Enter') applyHeadingDegFromInput();
+    });
+    document.getElementById('directNoAvoidanceMode').addEventListener('change', () => {
+      const enabled = Boolean(document.getElementById('directNoAvoidanceMode')?.checked);
+      showNavMessage(enabled ? 'warn' : '', enabled
+        ? '导航：已启用 <strong>直连不绕障</strong>，Slamware 会按指定路径走，遇障停止。'
+        : '导航：已切回 <strong>普通避障</strong>。');
+      tick();
     });
     document.getElementById('startNavigationBtn').addEventListener('click', startNavigation);
     document.getElementById('runWorkflowBtn').addEventListener('click', runWorkflow);

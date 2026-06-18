@@ -94,10 +94,11 @@ http://127.0.0.1:18083/
 - 地图工具栏只负责构建导航动作；真正执行入口在右侧 `动作链` 面板。
 - `执行动作链`：主执行入口，会按动作卡片顺序执行导航和后续动作。
 - `仅执行导航`：调试入口，只抽取动作链里的导航动作发送到 `/slamware_ros_sdk_server_node/move_to_locations`。
+- `直连不绕障`：使用 Slamware `MoveOptionFlag.KeyPoints` 模式，按指定航点直连走，不做自动绕障；遇到障碍会停止。
 - `停止`：发送 `/slamware_ros_sdk_server_node/cancel_action`。
 
 如果没有手动设置朝向，页面会自动用最后一段路径方向计算终点 `yaw`。如果只有一个航点且没有手动朝向，后端会使用当前里程计 yaw。
-服务发送导航请求时会同时设置 `MoveOptionFlag.WITH_YAW`，否则 Slamware 可能会忽略 `yaw` 字段并按路径方向结束。
+服务发送导航请求时会同时设置 `MoveOptionFlag.WITH_YAW`，否则 Slamware 可能会忽略 `yaw` 字段并按路径方向结束。勾选 `直连不绕障` 时会额外设置 `MoveOptionFlag.KeyPoints`。
 
 开始导航前，服务会检查地图、里程计、激光、超声/碰撞传感器是否新鲜，并检查航点是否在地图内、是否落在占用栅格上。碰撞/超声触发时不会启动导航。当前 `localization_quality=0` 默认只提示警告；如需强制限制，可以启动时增加 `--min-localization-quality N`。
 
