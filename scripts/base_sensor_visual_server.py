@@ -26,7 +26,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import rclpy
-from geometry_msgs.msg import Point, Twist
+from geometry_msgs.msg import Point, Pose, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -34,8 +34,11 @@ from sensor_msgs.msg import LaserScan, PointCloud2
 from slamware_ros_sdk.msg import (
     BasicSensorValueDataArray,
     CancelActionRequest,
+    LocalizationMovement,
     MoveToLocationsRequest,
+    RecoverLocalizationRequest,
     RobotBasicState,
+    SetMapLocalizationRequest,
 )
 from std_msgs.msg import String
 
@@ -76,6 +79,11 @@ def yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def quaternion_from_yaw(yaw: float) -> Dict[str, float]:
+    half = float(yaw) / 2.0
+    return {"x": 0.0, "y": 0.0, "z": math.sin(half), "w": math.cos(half)}
+
+
 def normalize_angle_rad(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
@@ -105,9 +113,11 @@ class SharedState:
         self.global_plan_path: Optional[Dict[str, Any]] = None
         self.robot_basic_state: Optional[Dict[str, Any]] = None
         self.slamware_state: Optional[Dict[str, Any]] = None
+        self.last_relocalization_command: Optional[Dict[str, Any]] = None
         self.arm_task_status: Optional[Dict[str, Any]] = None
         self.last_arm_task_command: Optional[Dict[str, Any]] = None
         self.last_navigation_command: Optional[Dict[str, Any]] = None
+        self.fault_snapshots: deque[Dict[str, Any]] = deque(maxlen=120)
         self.track: deque[Dict[str, float]] = deque(maxlen=max_track)
         self.seq = {
             "scan": 0,
@@ -118,9 +128,11 @@ class SharedState:
             "global_plan_path": 0,
             "robot_basic_state": 0,
             "slamware_state": 0,
+            "relocalization_command": 0,
             "navigation_command": 0,
             "arm_task_status": 0,
             "arm_task_command": 0,
+            "fault_snapshot": 0,
         }
 
     def snapshot(self) -> Dict[str, Any]:
@@ -141,12 +153,14 @@ class SharedState:
                     "global_plan_path": self.global_plan_path,
                     "robot_basic_state": self.robot_basic_state,
                     "slamware_state": self.slamware_state,
+                    "last_relocalization_command": self.last_relocalization_command,
                     "last_command": self.last_navigation_command,
                 },
                 "arm_control": {
                     "last_status": self.arm_task_status,
                     "last_command": self.last_arm_task_command,
                 },
+                "fault_snapshots": list(self.fault_snapshots)[-40:],
                 "freshness_s": {
                     "scan": self._age(self.scan, now),
                     "map": self._age(self.map, now),
@@ -341,6 +355,422 @@ class SavedPointStore:
         return "pt_" + uuid.uuid4().hex[:12]
 
 
+class RelocalizationAnchorStore:
+    def __init__(self, path: str) -> None:
+        self.path = FsPath(path)
+        self.lock = threading.RLock()
+        self.data: Dict[str, Any] = {"version": 1, "anchor": None}
+        self.load()
+
+    def load(self) -> None:
+        with self.lock:
+            if not self.path.exists():
+                self.data = {"version": 1, "anchor": None}
+                return
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                loaded = {"version": 1, "anchor": None}
+            anchor = loaded.get("anchor") if isinstance(loaded, dict) else None
+            self.data = {
+                "version": 1,
+                "anchor": self.normalize_anchor(anchor) if isinstance(anchor, dict) else None,
+            }
+
+    def normalize_anchor(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        x = finite_or_none(payload.get("x"), 5)
+        y = finite_or_none(payload.get("y"), 5)
+        yaw = finite_or_none(payload.get("yaw"))
+        if x is None or y is None:
+            return None
+        if yaw is None:
+            yaw_deg = finite_or_none(payload.get("yaw_deg"))
+            yaw = math.radians(float(yaw_deg)) if yaw_deg is not None else 0.0
+        yaw = normalize_angle_rad(float(yaw))
+        return {
+            "x": x,
+            "y": y,
+            "z": finite_or_none(payload.get("z"), 5) or 0.0,
+            "yaw": finite_or_none(yaw, 6),
+            "yaw_deg": finite_or_none(math.degrees(yaw), 3),
+            "frame_id": str(payload.get("frame_id") or ""),
+            "child_frame_id": str(payload.get("child_frame_id") or ""),
+            "source": str(payload.get("source") or "manual"),
+            "saved_at": str(payload.get("saved_at") or now_iso()),
+        }
+
+    def list_payload(self, current_odom: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        with self.lock:
+            return {
+                "ok": True,
+                "path": str(self.path),
+                "anchor": dict(self.data["anchor"]) if self.data.get("anchor") else None,
+                "current_odom": current_odom,
+            }
+
+    def save_from_odom(self, odom: Optional[Dict[str, Any]], source: str = "manual") -> Dict[str, Any]:
+        if not odom or odom.get("x") is None or odom.get("y") is None:
+            return {"ok": False, "error": "current odom is unavailable"}
+        payload = dict(odom)
+        payload["source"] = source
+        payload["saved_at"] = now_iso()
+        anchor = self.normalize_anchor(payload)
+        if not anchor:
+            return {"ok": False, "error": "invalid odom for relocalization anchor", "odom": odom}
+        with self.lock:
+            self.data = {"version": 1, "anchor": anchor}
+            self.write_locked()
+        return {"ok": True, "anchor": anchor, "path": str(self.path)}
+
+    def get_anchor(self) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            return dict(self.data["anchor"]) if self.data.get("anchor") else None
+
+    def write_locked(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, self.path)
+
+
+class FaultSnapshotLogger:
+    CLOSE_THRESHOLDS_M = (0.45, 0.60, 0.80, 1.00)
+
+    def __init__(self, state: SharedState, log_path: str, max_recent_errors: int = 12) -> None:
+        self.state = state
+        self.log_path = FsPath(log_path)
+        self.max_recent_errors = max(0, int(max_recent_errors))
+        self.lock = threading.RLock()
+        self.last_by_key: Dict[str, float] = {}
+
+    def list_payload(self) -> Dict[str, Any]:
+        with self.state.lock:
+            snapshots = list(self.state.fault_snapshots)
+        return {
+            "ok": True,
+            "count": len(snapshots),
+            "log_path": str(self.log_path),
+            "snapshots": snapshots,
+        }
+
+    def clear(self) -> Dict[str, Any]:
+        with self.state.lock:
+            self.state.fault_snapshots.clear()
+        return {"ok": True, "cleared": True, "log_path": str(self.log_path)}
+
+    def capture_manual(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        reason = str(payload.get("reason") or "manual_fault_snapshot").strip() or "manual_fault_snapshot"
+        extra = dict(payload)
+        extra.pop("reason", None)
+        snapshot = self.capture(reason, extra=extra, force=True)
+        return {"ok": True, "snapshot": snapshot, "log_path": str(self.log_path)}
+
+    def capture(
+        self,
+        reason: str,
+        extra: Optional[Dict[str, Any]] = None,
+        throttle_key: Optional[str] = None,
+        min_interval_s: float = 0.0,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        now = time.time()
+        key = throttle_key or reason
+        with self.lock:
+            if not force and min_interval_s > 0:
+                last = self.last_by_key.get(key)
+                if last is not None and now - last < min_interval_s:
+                    with self.state.lock:
+                        if self.state.fault_snapshots:
+                            return self.state.fault_snapshots[-1]
+                    return {"ok": False, "skipped": True, "reason": reason}
+                self.last_by_key[key] = now
+        snapshot = self.build_snapshot(reason, extra or {}, now)
+        with self.state.lock:
+            self.state.seq["fault_snapshot"] += 1
+            snapshot["seq"] = self.state.seq["fault_snapshot"]
+            self.state.fault_snapshots.append(snapshot)
+        self.append_log_line(snapshot)
+        return snapshot
+
+    def build_snapshot(self, reason: str, extra: Dict[str, Any], now: float) -> Dict[str, Any]:
+        with self.state.lock:
+            scan = self.state.scan
+            odom = self.state.odom
+            sensors = self.state.sensors
+            plan = self.state.global_plan_path
+            command = self.state.last_navigation_command
+            robot_basic_state = self.state.robot_basic_state
+            slamware_state = self.state.slamware_state
+            seq = dict(self.state.seq)
+            track_tail = list(self.state.track)[-20:]
+
+        snapshot = {
+            "ok": True,
+            "reason": str(reason),
+            "captured_at": now_iso(),
+            "captured_time": round(now, 3),
+            "seq": None,
+            "state_seq": seq,
+            "extra": self.safe_json(extra),
+            "odom": self.compact_odom(odom),
+            "goal": self.compute_goal_summary(command, odom, extra),
+            "navigation": {
+                "last_command": self.compact_command(command, now),
+                "global_plan_path": self.compact_plan(plan, now),
+                "robot_basic_state": self.compact_timed(robot_basic_state, now),
+                "slamware_state": self.compact_timed(slamware_state, now),
+            },
+            "scan": self.compact_scan(scan, now),
+            "sensors": self.compact_sensors(sensors, now),
+            "track_tail": [
+                {
+                    "x": finite_or_none(p.get("x"), 4),
+                    "y": finite_or_none(p.get("y"), 4),
+                    "yaw_deg": finite_or_none(math.degrees(float(p.get("yaw", 0.0))), 2),
+                    "age_s": finite_or_none(now - float(p.get("t", now)), 2),
+                }
+                for p in track_tail
+            ],
+            "recent_slamware_errors": self.read_recent_slamware_errors(),
+        }
+        return snapshot
+
+    @staticmethod
+    def safe_json(value: Any) -> Any:
+        try:
+            return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def compact_timed(item: Optional[Dict[str, Any]], now: float) -> Optional[Dict[str, Any]]:
+        if not item:
+            return None
+        output = {k: v for k, v in item.items() if k not in ("ranges", "data", "poses")}
+        if item.get("received_at") is not None:
+            output["age_s"] = finite_or_none(now - float(item["received_at"]), 3)
+        return output
+
+    @staticmethod
+    def compact_odom(odom: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not odom:
+            return None
+        return {
+            "received_at": odom.get("received_at"),
+            "topic": odom.get("topic"),
+            "frame_id": odom.get("frame_id"),
+            "x": finite_or_none(odom.get("x"), 5),
+            "y": finite_or_none(odom.get("y"), 5),
+            "z": finite_or_none(odom.get("z"), 5),
+            "yaw": finite_or_none(odom.get("yaw"), 6),
+            "yaw_deg": finite_or_none(odom.get("yaw_deg"), 3),
+            "seq": odom.get("seq"),
+        }
+
+    @staticmethod
+    def compact_command(command: Optional[Dict[str, Any]], now: float) -> Optional[Dict[str, Any]]:
+        if not command:
+            return None
+        keep = [
+            "received_at",
+            "type",
+            "seq",
+            "dry_run",
+            "waypoints",
+            "yaw",
+            "yaw_deg",
+            "yaw_source",
+            "move_option_flags",
+            "with_yaw",
+            "direct_no_avoidance",
+            "key_points_mode",
+            "navigation_mode",
+            "raw_cmd_vel",
+            "raw_nav_id",
+            "raw_nav_status",
+            "raw_nav_error",
+            "published_topic",
+        ]
+        output = {k: command.get(k) for k in keep if k in command}
+        if command.get("received_at") is not None:
+            output["age_s"] = finite_or_none(now - float(command["received_at"]), 3)
+        safety = command.get("safety")
+        if safety:
+            output["safety"] = {
+                "blockers": safety.get("blockers", []),
+                "warnings": safety.get("warnings", []),
+                "waypoint_checks": safety.get("waypoint_checks", []),
+            }
+        return output
+
+    @staticmethod
+    def compact_plan(plan: Optional[Dict[str, Any]], now: float) -> Optional[Dict[str, Any]]:
+        if not plan:
+            return None
+        output = {
+            "received_at": plan.get("received_at"),
+            "frame_id": plan.get("frame_id"),
+            "total_poses": plan.get("total_poses"),
+            "sampled_poses": plan.get("sampled_poses"),
+            "seq": plan.get("seq"),
+        }
+        if plan.get("received_at") is not None:
+            output["age_s"] = finite_or_none(now - float(plan["received_at"]), 3)
+        poses = plan.get("poses") or []
+        if poses:
+            output["first_pose"] = poses[0]
+            output["last_pose"] = poses[-1]
+        return output
+
+    def compact_scan(self, scan: Optional[Dict[str, Any]], now: float) -> Optional[Dict[str, Any]]:
+        if not scan:
+            return None
+        ranges = scan.get("ranges") or []
+        angle_min = finite_or_none(scan.get("angle_min"))
+        angle_increment = finite_or_none(scan.get("angle_increment"))
+        valid = []
+        if angle_min is not None and angle_increment is not None:
+            for idx, raw in enumerate(ranges):
+                value = finite_or_none(raw, 4)
+                if value is None:
+                    continue
+                angle = float(angle_min) + idx * float(angle_increment)
+                deg = self.normalize_deg(math.degrees(angle))
+                valid.append((float(value), deg, idx))
+        closest = sorted(valid, key=lambda item: item[0])[:16]
+        return {
+            "received_at": scan.get("received_at"),
+            "age_s": finite_or_none(now - float(scan.get("received_at", now)), 3)
+            if scan.get("received_at") is not None
+            else None,
+            "frame_id": scan.get("frame_id"),
+            "count": scan.get("count"),
+            "valid_count": scan.get("valid_count"),
+            "min_range": scan.get("min_range"),
+            "range_min": scan.get("range_min"),
+            "range_max": scan.get("range_max"),
+            "closest_points": [
+                {"range_m": finite_or_none(value, 4), "angle_deg": finite_or_none(deg, 1), "index": idx}
+                for value, deg, idx in closest
+            ],
+            "close_counts": {
+                f"lt_{str(th).replace('.', '_')}m": sum(1 for value, _deg, _idx in valid if value < th)
+                for th in self.CLOSE_THRESHOLDS_M
+            },
+        }
+
+    @staticmethod
+    def compact_sensors(sensors: Optional[Dict[str, Any]], now: float) -> Optional[Dict[str, Any]]:
+        if not sensors:
+            return None
+        items = []
+        for item in sensors.get("items", []):
+            items.append(
+                {
+                    "id": item.get("id"),
+                    "sensor_type": item.get("sensor_type"),
+                    "sensor_type_name": item.get("sensor_type_name"),
+                    "impact_type_name": item.get("impact_type_name"),
+                    "pose": item.get("pose"),
+                    "is_in_impact": item.get("is_in_impact"),
+                    "value": item.get("value"),
+                }
+            )
+        hits = [item for item in items if item.get("is_in_impact")]
+        return {
+            "received_at": sensors.get("received_at"),
+            "age_s": finite_or_none(now - float(sensors.get("received_at", now)), 3)
+            if sensors.get("received_at") is not None
+            else None,
+            "count": sensors.get("count"),
+            "hits": hits,
+            "items": items,
+            "seq": sensors.get("seq"),
+        }
+
+    def compute_goal_summary(
+        self,
+        command: Optional[Dict[str, Any]],
+        odom: Optional[Dict[str, Any]],
+        extra: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        goal = None
+        waypoints = command.get("waypoints") if command else None
+        if isinstance(waypoints, list) and waypoints:
+            goal = waypoints[-1]
+        action = extra.get("action") if isinstance(extra, dict) else None
+        if not goal and isinstance(action, dict) and action.get("x") is not None and action.get("y") is not None:
+            goal = {"x": action.get("x"), "y": action.get("y"), "yaw_deg": action.get("yawDeg")}
+        if not goal:
+            return None
+        output = {
+            "target": {
+                "x": finite_or_none(goal.get("x"), 5),
+                "y": finite_or_none(goal.get("y"), 5),
+                "yaw_deg": finite_or_none(goal.get("yaw_deg", goal.get("yawDeg")), 3),
+            }
+        }
+        if odom and odom.get("x") is not None and odom.get("y") is not None:
+            dx = float(goal.get("x", 0.0)) - float(odom.get("x", 0.0))
+            dy = float(goal.get("y", 0.0)) - float(odom.get("y", 0.0))
+            bearing = math.atan2(dy, dx)
+            yaw = finite_or_none(odom.get("yaw"))
+            output.update(
+                {
+                    "distance_m": finite_or_none(math.hypot(dx, dy), 4),
+                    "bearing_map_deg": finite_or_none(math.degrees(bearing), 2),
+                    "bearing_robot_deg": finite_or_none(math.degrees(normalize_angle_rad(bearing - float(yaw))), 2)
+                    if yaw is not None
+                    else None,
+                }
+            )
+        return output
+
+    @staticmethod
+    def normalize_deg(deg: float) -> float:
+        return ((deg + 180.0) % 360.0) - 180.0
+
+    def read_recent_slamware_errors(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {"log_path": None, "lines": []}
+        if self.max_recent_errors <= 0:
+            return result
+        try:
+            log_dir = FsPath("/unitree/var/log/slamware_service_pc4")
+            logs = sorted(log_dir.glob("slamware_*.log"), key=lambda p: p.stat().st_mtime)
+            if not logs:
+                return result
+            log_path = logs[-1]
+            result["log_path"] = str(log_path)
+            with log_path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 262144), os.SEEK_SET)
+                text = f.read().decode("utf-8", "replace")
+            interesting = []
+            for line in text.splitlines():
+                if (
+                    "[ERROR]" in line
+                    or "OperationFailException" in line
+                    or "bad_alloc" in line
+                    or "PathFindFail" in line
+                    or "Exception" in line
+                ):
+                    interesting.append(line[-800:])
+            result["lines"] = interesting[-self.max_recent_errors :]
+        except Exception as exc:
+            result["error"] = str(exc)
+        return result
+
+    def append_log_line(self, snapshot: Dict[str, Any]) -> None:
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(snapshot, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+                f.write("\n")
+        except Exception as exc:
+            snapshot["log_write_error"] = str(exc)
+
+
 class BaseSensorNode(Node):
     def __init__(
         self,
@@ -352,6 +782,9 @@ class BaseSensorNode(Node):
         pointcloud_topics: Iterable[str],
         move_to_locations_topic: str,
         cancel_action_topic: str,
+        set_pose_topic: str,
+        recover_localization_topic: str,
+        set_map_localization_topic: str,
         cmd_vel_topic: str,
         global_plan_path_topic: str,
         robot_basic_state_topic: str,
@@ -372,12 +805,25 @@ class BaseSensorNode(Node):
         raw_nav_position_tolerance_m: float,
         raw_nav_yaw_tolerance_deg: float,
         min_localization_quality: int,
+        relocalization_store: RelocalizationAnchorStore,
+        relocalization_search_radius_m: float,
+        relocalization_max_time_ms: int,
+        relocalization_movement: str,
         max_cloud_points: int,
+        fault_log_path: str,
     ) -> None:
         super().__init__("base_sensor_visual_server")
         self.state = state
+        self.fault_logger = FaultSnapshotLogger(state, fault_log_path)
         self.max_cloud_points = max(10, int(max_cloud_points))
         self.min_localization_quality = int(min_localization_quality)
+        self.relocalization_store = relocalization_store
+        self.relocalization_search_radius_m = max(0.05, min(3.0, float(relocalization_search_radius_m)))
+        self.relocalization_max_time_ms = max(1000, min(60000, int(relocalization_max_time_ms)))
+        self.relocalization_movement = str(relocalization_movement or "NO_MOVE").strip().upper()
+        self.set_pose_topic = str(set_pose_topic)
+        self.recover_localization_topic = str(recover_localization_topic)
+        self.set_map_localization_topic = str(set_map_localization_topic)
         self.arm_command_topic = arm_command_topic
         self.arm_status_topic = arm_status_topic
         self.arm_task_timeout_sec = max(1.0, float(arm_task_timeout_sec))
@@ -399,6 +845,12 @@ class BaseSensorNode(Node):
         self.raw_nav_stop = threading.Event()
         self.raw_nav_thread: Optional[threading.Thread] = None
         self.raw_nav_id: Optional[str] = None
+        self.nav_monitor_lock = threading.RLock()
+        self.nav_monitor_seq: Optional[int] = None
+        self.nav_monitor_last_pose: Optional[Dict[str, Any]] = None
+        self.nav_monitor_last_motion_at = time.time()
+        self.cancel_monitor_seq: Optional[int] = None
+        self.cancel_monitor_pose: Optional[Dict[str, Any]] = None
         self.arm_status_condition = threading.Condition()
         self.arm_status_by_task_id: Dict[str, List[Dict[str, Any]]] = {}
         qos = make_reliable_qos(depth=10)
@@ -417,13 +869,288 @@ class BaseSensorNode(Node):
             self.create_subscription(PointCloud2, topic, self.make_point_cloud_cb(topic), qos)
         self.move_to_locations_pub = self.create_publisher(MoveToLocationsRequest, move_to_locations_topic, qos)
         self.cancel_action_pub = self.create_publisher(CancelActionRequest, cancel_action_topic, qos)
+        self.set_pose_pub = self.create_publisher(Pose, set_pose_topic, qos)
+        self.recover_localization_pub = self.create_publisher(RecoverLocalizationRequest, recover_localization_topic, qos)
+        self.set_map_localization_pub = self.create_publisher(SetMapLocalizationRequest, set_map_localization_topic, qos)
         self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, qos)
         self.arm_task_command_pub = self.create_publisher(String, arm_command_topic, qos)
         self.get_logger().info(
             f"subscribed scan={scan_topic} map={map_topic} sensors={sensors_topic} "
             f"pointclouds={pointcloud_topics} plan={global_plan_path_topic} "
-            f"cmd_vel={cmd_vel_topic} arm_status={arm_status_topic}"
+            f"cmd_vel={cmd_vel_topic} arm_status={arm_status_topic} "
+            f"relocalization={recover_localization_topic}"
         )
+
+    def relocalization_status(self) -> Dict[str, Any]:
+        with self.state.lock:
+            current_odom = dict(self.state.odom) if self.state.odom else None
+            basic = dict(self.state.robot_basic_state) if self.state.robot_basic_state else None
+            last = dict(self.state.last_relocalization_command) if self.state.last_relocalization_command else None
+        payload = self.relocalization_store.list_payload(current_odom=current_odom)
+        payload.update(
+            {
+                "robot_basic_state": basic,
+                "last_relocalization_command": last,
+                "default_search_radius_m": self.relocalization_search_radius_m,
+                "default_max_time_ms": self.relocalization_max_time_ms,
+                "default_movement": self.relocalization_movement,
+            }
+        )
+        return payload
+
+    def save_relocalization_anchor(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        with self.state.lock:
+            odom = dict(self.state.odom) if self.state.odom else None
+        source = str(payload.get("source") or "manual").strip() or "manual"
+        return self.relocalization_store.save_from_odom(odom, source=source)
+
+    @staticmethod
+    def resolve_localization_movement(value: Any, fallback: str = "NO_MOVE") -> Tuple[int, str]:
+        raw = str(value or fallback or "NO_MOVE").strip().upper()
+        mapping = {
+            "NO_MOVE": int(LocalizationMovement.NO_MOVE),
+            "ROTATE_ONLY": int(LocalizationMovement.ROTATE_ONLY),
+            "ANY": int(LocalizationMovement.ANY),
+        }
+        if raw not in mapping:
+            raw = "NO_MOVE"
+        return mapping[raw], raw
+
+    def run_relocalization(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        anchor_payload = payload.get("anchor")
+        anchor = self.relocalization_store.normalize_anchor(anchor_payload) if isinstance(anchor_payload, dict) else None
+        if not anchor:
+            anchor = self.relocalization_store.get_anchor()
+        if not anchor:
+            return {"ok": False, "error": "no relocalization anchor; save current pose as anchor first"}
+
+        radius = finite_or_none(payload.get("search_radius_m", payload.get("searchRadiusM", self.relocalization_search_radius_m)), 3)
+        if radius is None:
+            radius = self.relocalization_search_radius_m
+        radius = max(0.05, min(3.0, float(radius)))
+        max_time_ms = finite_or_none(payload.get("max_time_ms", payload.get("maxTimeMs", self.relocalization_max_time_ms)))
+        if max_time_ms is None:
+            max_time_ms = self.relocalization_max_time_ms
+        max_time_ms = max(1000, min(60000, int(max_time_ms)))
+        movement_type, movement_name = self.resolve_localization_movement(
+            payload.get("movement", payload.get("movement_type", payload.get("movementType", self.relocalization_movement))),
+            self.relocalization_movement,
+        )
+        dry_run = bool(payload.get("dry_run") or payload.get("dryRun"))
+        use_set_pose = not (payload.get("set_pose") is False or payload.get("setPose") is False)
+        enable_localization = not (payload.get("enable_localization") is False or payload.get("enableLocalization") is False)
+
+        if not dry_run and enable_localization:
+            map_localization = SetMapLocalizationRequest()
+            map_localization.enabled = True
+            self.set_map_localization_pub.publish(map_localization)
+
+        pose_msg = Pose()
+        pose_msg.position.x = float(anchor["x"])
+        pose_msg.position.y = float(anchor["y"])
+        pose_msg.position.z = float(anchor.get("z") or 0.0)
+        q = quaternion_from_yaw(float(anchor.get("yaw") or 0.0))
+        pose_msg.orientation.x = q["x"]
+        pose_msg.orientation.y = q["y"]
+        pose_msg.orientation.z = q["z"]
+        pose_msg.orientation.w = q["w"]
+        if not dry_run and use_set_pose:
+            self.set_pose_pub.publish(pose_msg)
+
+        req = RecoverLocalizationRequest()
+        req.area.x = float(anchor["x"]) - radius
+        req.area.y = float(anchor["y"]) - radius
+        req.area.w = radius * 2.0
+        req.area.h = radius * 2.0
+        req.options.max_time_ms.is_valid = True
+        req.options.max_time_ms.value = int(max_time_ms)
+        req.options.mvmt_type.is_valid = True
+        req.options.mvmt_type.value.type = int(movement_type)
+        if not dry_run:
+            self.recover_localization_pub.publish(req)
+
+        command = {
+            "received_at": time.time(),
+            "type": "slamware_relocalization",
+            "dry_run": dry_run,
+            "anchor": anchor,
+            "search_radius_m": finite_or_none(radius, 3),
+            "area": {
+                "x": finite_or_none(req.area.x, 3),
+                "y": finite_or_none(req.area.y, 3),
+                "w": finite_or_none(req.area.w, 3),
+                "h": finite_or_none(req.area.h, 3),
+            },
+            "max_time_ms": int(max_time_ms),
+            "movement": movement_name,
+            "set_pose": use_set_pose,
+            "enable_localization": enable_localization,
+            "published_topics": {
+                "set_pose": self.set_pose_topic,
+                "recover_localization": self.recover_localization_topic,
+                "set_map_localization": self.set_map_localization_topic,
+            },
+        }
+        with self.state.lock:
+            self.state.seq["relocalization_command"] += 1
+            command["seq"] = self.state.seq["relocalization_command"]
+            self.state.last_relocalization_command = command
+        return {"ok": True, "relocalization_started": not dry_run, "dry_run": dry_run, "command": command}
+
+    def current_navigation_command(self, max_age_s: float = 300.0) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        with self.state.lock:
+            command = self.state.last_navigation_command
+        if not command or command.get("dry_run"):
+            return None
+        if command.get("type") not in ("move_to_locations", "raw_cmd_vel_navigation"):
+            return None
+        received_at = command.get("received_at")
+        if received_at is None or now - float(received_at) > max_age_s:
+            return None
+        return command
+
+    def reset_navigation_monitor(self, command: Dict[str, Any]) -> None:
+        with self.state.lock:
+            odom = self.state.odom
+        with self.nav_monitor_lock:
+            self.nav_monitor_seq = int(command.get("seq") or -1)
+            self.nav_monitor_last_pose = self.fault_logger.compact_odom(odom)
+            self.nav_monitor_last_motion_at = time.time()
+
+    def reset_cancel_monitor(self, command: Dict[str, Any]) -> None:
+        with self.state.lock:
+            odom = self.state.odom
+        with self.nav_monitor_lock:
+            self.cancel_monitor_seq = int(command.get("seq") or -1)
+            self.cancel_monitor_pose = self.fault_logger.compact_odom(odom)
+
+    def maybe_log_plan_zero(self, plan_payload: Dict[str, Any]) -> None:
+        command = self.current_navigation_command(max_age_s=300.0)
+        if not command or command.get("type") != "move_to_locations":
+            return
+        now = time.time()
+        if int(plan_payload.get("total_poses") or 0) != 0:
+            return
+        if now - float(command.get("received_at") or now) < 1.0:
+            return
+        seq = command.get("seq", "unknown")
+        self.fault_logger.capture(
+            "global_plan_zero",
+            extra={
+                "plan_seq": plan_payload.get("seq"),
+                "seconds_since_command": finite_or_none(now - float(command.get("received_at", now)), 3),
+            },
+            throttle_key=f"global_plan_zero:{seq}",
+            min_interval_s=5.0,
+        )
+
+    def maybe_log_laser_close(self, scan_payload: Dict[str, Any]) -> None:
+        command = self.current_navigation_command(max_age_s=300.0)
+        if not command:
+            return
+        min_range = finite_or_none(scan_payload.get("min_range"))
+        if min_range is None or float(min_range) > 0.60:
+            return
+        seq = command.get("seq", "unknown")
+        self.fault_logger.capture(
+            "laser_close_during_navigation",
+            extra={"scan_seq": scan_payload.get("seq"), "min_range_m": min_range},
+            throttle_key=f"laser_close:{seq}",
+            min_interval_s=3.0,
+        )
+
+    def maybe_log_sensor_impacts(self, sensors_payload: Dict[str, Any]) -> None:
+        hits = [item for item in sensors_payload.get("items", []) if item.get("is_in_impact")]
+        if not hits:
+            return
+        command = self.current_navigation_command(max_age_s=300.0)
+        nav_seq = command.get("seq") if command else "no_active_nav"
+        hit_ids = ",".join(str(item.get("id")) for item in hits)
+        self.fault_logger.capture(
+            "sensor_impact",
+            extra={"sensor_seq": sensors_payload.get("seq"), "hit_ids": hit_ids},
+            throttle_key=f"sensor_impact:{nav_seq}:{hit_ids}",
+            min_interval_s=2.0,
+        )
+
+    def observe_odom_for_faults(self, odom_payload: Dict[str, Any]) -> None:
+        now = time.time()
+        command = self.current_navigation_command(max_age_s=300.0)
+        if command:
+            seq = int(command.get("seq") or -1)
+            with self.nav_monitor_lock:
+                if self.nav_monitor_seq != seq:
+                    self.nav_monitor_seq = seq
+                    self.nav_monitor_last_pose = self.fault_logger.compact_odom(odom_payload)
+                    self.nav_monitor_last_motion_at = now
+                    return
+                last_pose = self.nav_monitor_last_pose
+                if last_pose and odom_payload.get("x") is not None and odom_payload.get("y") is not None:
+                    moved = math.hypot(float(odom_payload["x"]) - float(last_pose.get("x") or 0.0),
+                                       float(odom_payload["y"]) - float(last_pose.get("y") or 0.0))
+                    yaw_delta = self.pose_yaw_delta_deg(odom_payload, last_pose)
+                    if moved > 0.015 or yaw_delta > 1.5:
+                        self.nav_monitor_last_pose = self.fault_logger.compact_odom(odom_payload)
+                        self.nav_monitor_last_motion_at = now
+                        return
+                still_for = now - self.nav_monitor_last_motion_at
+            if now - float(command.get("received_at") or now) > 4.0 and still_for >= 3.0:
+                self.fault_logger.capture(
+                    "odom_still_during_navigation",
+                    extra={"still_for_s": finite_or_none(still_for, 3), "odom_seq": odom_payload.get("seq")},
+                    throttle_key=f"odom_still:{seq}",
+                    min_interval_s=5.0,
+                )
+            return
+
+        with self.state.lock:
+            last_command = self.state.last_navigation_command
+        if not last_command or last_command.get("type") != "cancel_action":
+            return
+        age = now - float(last_command.get("received_at") or now)
+        if age < 0.5 or age > 20.0:
+            return
+        with self.nav_monitor_lock:
+            cancel_seq = int(last_command.get("seq") or -1)
+            if self.cancel_monitor_seq != cancel_seq or not self.cancel_monitor_pose:
+                self.cancel_monitor_seq = cancel_seq
+                self.cancel_monitor_pose = self.fault_logger.compact_odom(odom_payload)
+                return
+            cancel_pose = self.cancel_monitor_pose
+        if odom_payload.get("x") is None or odom_payload.get("y") is None:
+            return
+        moved_after_cancel = math.hypot(
+            float(odom_payload["x"]) - float(cancel_pose.get("x") or 0.0),
+            float(odom_payload["y"]) - float(cancel_pose.get("y") or 0.0),
+        )
+        yaw_after_cancel = self.pose_yaw_delta_deg(odom_payload, cancel_pose)
+        if moved_after_cancel > 0.05 or yaw_after_cancel > 5.0:
+            self.fault_logger.capture(
+                "movement_after_cancel",
+                extra={
+                    "seconds_since_cancel": finite_or_none(age, 3),
+                    "moved_after_cancel_m": finite_or_none(moved_after_cancel, 4),
+                    "yaw_after_cancel_deg": finite_or_none(yaw_after_cancel, 2),
+                    "odom_seq": odom_payload.get("seq"),
+                },
+                throttle_key=f"movement_after_cancel:{last_command.get('seq')}",
+                min_interval_s=999.0,
+            )
+
+    @staticmethod
+    def pose_yaw_delta_deg(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+        yaw_a = finite_or_none(a.get("yaw"))
+        yaw_b = finite_or_none(b.get("yaw"))
+        if yaw_a is not None and yaw_b is not None:
+            return abs(math.degrees(normalize_angle_rad(float(yaw_a) - float(yaw_b))))
+        deg_a = finite_or_none(a.get("yaw_deg"))
+        deg_b = finite_or_none(b.get("yaw_deg"))
+        if deg_a is None or deg_b is None:
+            return 0.0
+        return abs(math.degrees(normalize_angle_rad(math.radians(float(deg_a) - float(deg_b)))))
 
     def on_scan(self, msg: LaserScan) -> None:
         now = time.time()
@@ -455,6 +1182,7 @@ class BaseSensorNode(Node):
             self.state.seq["scan"] += 1
             payload["seq"] = self.state.seq["scan"]
             self.state.scan = payload
+        self.maybe_log_laser_close(payload)
 
     def on_map(self, msg: OccupancyGrid) -> None:
         now = time.time()
@@ -517,6 +1245,7 @@ class BaseSensorNode(Node):
                 self.state.odom = payload
                 if math.isfinite(track_point["x"]) and math.isfinite(track_point["y"]):
                     self.state.track.append(track_point)
+            self.observe_odom_for_faults(payload)
 
         return on_odom
 
@@ -554,6 +1283,7 @@ class BaseSensorNode(Node):
             self.state.seq["sensors"] += 1
             payload["seq"] = self.state.seq["sensors"]
             self.state.sensors = payload
+        self.maybe_log_sensor_impacts(payload)
 
     def on_global_plan_path(self, msg: Path) -> None:
         now = time.time()
@@ -583,6 +1313,7 @@ class BaseSensorNode(Node):
             self.state.seq["global_plan_path"] += 1
             payload["seq"] = self.state.seq["global_plan_path"]
             self.state.global_plan_path = payload
+        self.maybe_log_plan_zero(payload)
 
     def on_robot_basic_state(self, msg: RobotBasicState) -> None:
         now = time.time()
@@ -955,6 +1686,11 @@ class BaseSensorNode(Node):
 
         safety = self.check_navigation_safety(waypoints)
         if safety["blockers"]:
+            self.fault_logger.capture(
+                "navigation_start_blocked",
+                extra={"waypoints": waypoints, "safety": safety},
+                force=True,
+            )
             return {"ok": False, "error": "navigation safety check failed", "safety": safety}
 
         yaw_result = self.resolve_navigation_yaw(payload, waypoints)
@@ -983,14 +1719,13 @@ class BaseSensorNode(Node):
         if direct_no_avoidance:
             request.options.opt_flags.flags = int(request.options.opt_flags.flags) | SLAMWARE_MOVE_OPTION_KEY_POINTS
 
-        speed_ratio = payload.get("speed_ratio")
-        if speed_ratio is not None:
-            try:
-                speed = max(0.05, min(1.0, float(speed_ratio)))
-                request.options.speed_ratio.is_valid = True
-                request.options.speed_ratio.value = speed
-            except (TypeError, ValueError):
-                return {"ok": False, "error": "invalid speed_ratio"}
+        speed_ratio = payload.get("speed_ratio", payload.get("speedRatio", 1.0))
+        try:
+            speed = max(0.05, min(1.0, float(speed_ratio)))
+            request.options.speed_ratio.is_valid = True
+            request.options.speed_ratio.value = speed
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "invalid speed_ratio"}
 
         dry_run = bool(payload.get("dry_run"))
         now = time.time()
@@ -1019,6 +1754,13 @@ class BaseSensorNode(Node):
             self.state.seq["navigation_command"] += 1
             command["seq"] = self.state.seq["navigation_command"]
             self.state.last_navigation_command = command
+        if not dry_run:
+            self.reset_navigation_monitor(command)
+        self.fault_logger.capture(
+            "navigation_start",
+            extra={"waypoints": waypoints, "yaw_result": yaw_result, "request": payload},
+            force=True,
+        )
         return {"ok": True, "navigation_started": not dry_run, "dry_run": dry_run, "command": command}
 
     def start_raw_cmd_vel_navigation(
@@ -1078,6 +1820,11 @@ class BaseSensorNode(Node):
             previous_command = dict(self.state.last_navigation_command) if self.state.last_navigation_command else None
         if dry_run:
             record_command()
+            self.fault_logger.capture(
+                "raw_navigation_start",
+                extra={"waypoints": waypoints, "yaw_result": yaw_result, "request": payload},
+                force=True,
+            )
             return {"ok": True, "navigation_started": False, "dry_run": True, "command": command}
 
         active_thread = None
@@ -1097,6 +1844,11 @@ class BaseSensorNode(Node):
                         if self.raw_nav_id == active_id:
                             self.raw_nav_id = None
             if active_thread.is_alive():
+                self.fault_logger.capture(
+                    "raw_navigation_start_blocked",
+                    extra={"reason": "raw cmd_vel navigation is already running", "active_raw_nav_id": active_id},
+                    force=True,
+                )
                 return {
                     "ok": False,
                     "error": "raw cmd_vel navigation is already running",
@@ -1109,6 +1861,11 @@ class BaseSensorNode(Node):
 
         with self.raw_nav_lock:
             if self.raw_nav_thread and self.raw_nav_thread.is_alive():
+                self.fault_logger.capture(
+                    "raw_navigation_start_blocked",
+                    extra={"reason": "raw cmd_vel navigation is already running", "active_raw_nav_id": self.raw_nav_id},
+                    force=True,
+                )
                 return {
                     "ok": False,
                     "error": "raw cmd_vel navigation is already running",
@@ -1126,6 +1883,12 @@ class BaseSensorNode(Node):
                 daemon=True,
             )
             record_command()
+            self.reset_navigation_monitor(command)
+            self.fault_logger.capture(
+                "raw_navigation_start",
+                extra={"waypoints": waypoints, "yaw_result": yaw_result, "request": payload},
+                force=True,
+            )
             self.raw_nav_thread.start()
         return {"ok": True, "navigation_started": True, "dry_run": False, "command": command}
 
@@ -1242,6 +2005,12 @@ class BaseSensorNode(Node):
             self.state.seq["navigation_command"] += 1
             command["seq"] = self.state.seq["navigation_command"]
             self.state.last_navigation_command = command
+        self.reset_cancel_monitor(command)
+        self.fault_logger.capture(
+            "navigation_cancel",
+            extra={"raw_cancelled": raw_cancelled},
+            force=True,
+        )
         return {"ok": True, "navigation_cancelled": True, "command": command}
 
     def cancel_raw_cmd_vel_navigation(self) -> bool:
@@ -1682,9 +2451,10 @@ HTML = r"""<!doctype html>
       display: grid;
       gap: 8px;
       padding: 10px;
-      max-height: 520px;
+      max-height: min(62vh, 720px);
       overflow: auto;
       align-content: start;
+      overscroll-behavior: contain;
     }
     .workflow-step {
       position: relative;
@@ -1730,8 +2500,8 @@ HTML = r"""<!doctype html>
     }
     .workflow-title {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
-      align-items: center;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
       gap: 8px;
       font-weight: 750;
       min-width: 0;
@@ -1741,9 +2511,17 @@ HTML = r"""<!doctype html>
       align-items: center;
       gap: 6px;
       min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      overflow-wrap: anywhere;
+      white-space: normal;
+      line-height: 1.25;
+    }
+    .workflow-actions-inline {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 6px;
+      flex-wrap: wrap;
+      min-width: 0;
     }
     .drag-handle {
       color: var(--muted);
@@ -1759,6 +2537,15 @@ HTML = r"""<!doctype html>
       border-color: #fecaca;
       color: #b91c1c;
       background: #fff7f7;
+      white-space: nowrap;
+    }
+    .workflow-edit {
+      padding: 4px 9px;
+      font-size: 12px;
+      font-weight: 700;
+      border-color: #bfdbfe;
+      color: #1d4ed8;
+      background: #eff6ff;
       white-space: nowrap;
     }
     .workflow-detail {
@@ -1864,6 +2651,108 @@ HTML = r"""<!doctype html>
       font-size: 12px;
     }
     .kv strong { color: var(--text); font-weight: 600; text-align: right; }
+    .scan-alert {
+      border-top: 1px solid var(--line);
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+      background: #fbfcfe;
+    }
+    .scan-alert-summary {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font-size: 13px;
+      color: var(--muted);
+      background: #fff;
+    }
+    .scan-alert-summary strong { color: var(--text); }
+    .scan-alert-summary.warn { border-color: #facc15; background: #fffbe8; color: #854d0e; }
+    .scan-alert-summary.danger { border-color: #fca5a5; background: #fff1f2; color: #991b1b; }
+    .scan-sector-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .scan-sector-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: #fff;
+      min-height: 52px;
+    }
+    .scan-sector-card.warn { border-color: #facc15; background: #fffbe8; }
+    .scan-sector-card.danger { border-color: #fca5a5; background: #fff1f2; }
+    .scan-sector-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 700;
+      font-size: 12px;
+    }
+    .scan-sector-meta { margin-top: 4px; color: var(--muted); font-size: 11px; }
+    .fault-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px;
+      border-top: 1px solid var(--line);
+      align-items: center;
+    }
+    .fault-list {
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border-top: 1px solid var(--line);
+      max-height: 420px;
+      overflow: auto;
+      background: #fbfcfe;
+    }
+    .fault-empty {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 8px 0;
+    }
+    .fault-item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fff;
+      display: grid;
+      gap: 6px;
+    }
+    .fault-item.warn { border-color: #facc15; background: #fffbe8; }
+    .fault-item.danger { border-color: #fca5a5; background: #fff1f2; }
+    .fault-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 800;
+    }
+    .fault-title small {
+      color: var(--muted);
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .fault-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .fault-grid strong { color: var(--text); }
+    .fault-errors {
+      margin: 0;
+      padding: 8px;
+      border-radius: 6px;
+      background: #0f172a;
+      color: #dbeafe;
+      white-space: pre-wrap;
+      overflow: auto;
+      max-height: 96px;
+      font-size: 11px;
+    }
     .readout {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1930,6 +2819,24 @@ HTML = r"""<!doctype html>
       height: 16px;
       margin: 0;
       accent-color: #d97706;
+    }
+    .speed-ratio-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 38px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+    .speed-ratio-label input {
+      width: 72px;
+      border: 1px solid #b9c6d8;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+      color: var(--text);
     }
     .heading-input {
       width: 96px;
@@ -2074,6 +2981,10 @@ HTML = r"""<!doctype html>
         <button id="clearHeadingBtn">清除朝向</button>
         <input id="headingDegInput" class="heading-input" type="number" step="1" min="-180" max="180" placeholder="角度°" />
         <button id="applyHeadingDegBtn">应用角度</button>
+        <label class="speed-ratio-label" title="Slamware speed_ratio，1.0 为最大">
+          导航速度
+          <input id="navSpeedRatioInput" type="number" step="0.05" min="0.05" max="1" value="1" />
+        </label>
         <label class="nav-mode-toggle" title="使用 Slamware KeyPoints 模式：按指定路径走，不自动绕障；遇到障碍会停止。">
           <input id="directNoAvoidanceMode" type="checkbox" />
           直连不绕障
@@ -2082,9 +2993,24 @@ HTML = r"""<!doctype html>
           <input id="rawCmdVelNoAvoidanceMode" type="checkbox" />
           裸控无避障
         </label>
+        <label class="speed-ratio-label" title="Slamware recover_localization 搜索半径；默认假设关机后机器人没有移动。">
+          重定位半径
+          <input id="relocalizationRadiusInput" type="number" step="0.05" min="0.05" max="3" value="0.6" />
+        </label>
+        <label class="speed-ratio-label" title="默认不移动；如果静态匹配不够，再手动选择原地旋转。">
+          重定位方式
+          <select id="relocalizationMovementInput">
+            <option value="NO_MOVE">不移动</option>
+            <option value="ROTATE_ONLY">原地旋转</option>
+            <option value="ANY">允许移动</option>
+          </select>
+        </label>
+        <button id="saveRelocalizationAnchorBtn" title="把当前 odom 保存为下次开机重定位基准">保存开机基准</button>
+        <button id="runRelocalizationBtn" title="用保存的基准位姿 set_pose，并在基准周围调用 Slamware recover_localization">按基准重定位</button>
         <span id="navHint" class="nav-hint">在地图上点击快速增加导航动作</span>
       </div>
       <div id="navStatus" class="nav-status">导航：等待选点</div>
+      <div id="relocalizationStatus" class="nav-status">重定位：等待保存开机基准</div>
       <div class="readout">
         <div class="metric"><div class="label">X</div><div id="odomX" class="value">--</div></div>
         <div class="metric"><div class="label">Y</div><div id="odomY" class="value">--</div></div>
@@ -2133,6 +3059,9 @@ HTML = r"""<!doctype html>
               <label class="nav-action-field">Yaw deg
                 <input id="newActionYawDeg" type="number" step="0.1" placeholder="当前" />
               </label>
+              <label class="nav-action-field">导航速度
+                <input id="newActionSpeedRatio" type="number" step="0.05" min="0.05" max="1" value="1" />
+              </label>
               <label class="arm-action-field">抓取目标
                 <select id="newArmTargetObject">
                   <option value="XiongMao">XiongMao / 熊猫烟</option>
@@ -2142,12 +3071,13 @@ HTML = r"""<!doctype html>
               <label class="arm-action-field">超时 s
                 <input id="newArmTimeoutSec" type="number" step="1" min="1" max="600" value="120" />
               </label>
-              <label class="column-action-field">目标高度 m
-                <input id="newColumnTargetHeightM" type="number" step="0.001" min="-1" max="1" value="0" />
+              <label class="column-action-field">目标 raw 高度 m
+                <input id="newColumnTargetHeightM" type="number" step="0.001" min="-0.053" max="0.376" value="0" />
               </label>
               <label class="column-action-field">超时 s
                 <input id="newColumnTimeoutSec" type="number" step="1" min="1" max="180" value="30" />
               </label>
+              <div class="column-action-field workflow-detail">可填闭环目标：-0.053 ~ 0.376 m；当前遥控器最高实测 raw=0.3759m。</div>
             </div>
             <div class="action-builder-actions">
               <button id="fillCurrentPoseBtn">填当前位置</button>
@@ -2219,6 +3149,7 @@ HTML = r"""<!doctype html>
         <div class="metric"><div class="label">Frame</div><div id="scanFrame" class="value">--</div></div>
         <div class="metric"><div class="label">Age</div><div id="scanAge" class="value">--</div></div>
       </div>
+      <div id="scanAlert" class="scan-alert"></div>
     </section>
 
     <section>
@@ -2227,6 +3158,19 @@ HTML = r"""<!doctype html>
         <span id="sensorMeta" class="meta">waiting</span>
       </div>
       <div id="sensorGrid" class="sensor-grid"></div>
+    </section>
+
+    <section>
+      <div class="panel-head">
+        <h2>导航故障快照</h2>
+        <span id="faultSnapshotMeta" class="meta">waiting</span>
+      </div>
+      <div class="fault-toolbar">
+        <button id="manualFaultSnapshotBtn">记录当前状态</button>
+        <button id="clearFaultSnapshotsBtn" class="danger">清空页面快照</button>
+        <span class="meta">自动记录：开始导航 / plan=0 / 里程计不动 / 停止 / 传感器触发</span>
+      </div>
+      <div id="faultSnapshotList" class="fault-list"></div>
     </section>
 
     <section>
@@ -2264,6 +3208,7 @@ HTML = r"""<!doctype html>
     let savedPoints = [];
     let editingPointId = null;
     let workflowActions = [];
+    let editingActionId = null;
     let draggedActionId = null;
     let workflowRun = {
       running: false,
@@ -2291,6 +3236,15 @@ HTML = r"""<!doctype html>
     const NAV_IDLE_STABLE_MS = 1800;
     const NAV_ODOM_STILL_M = 0.008;
     const NAV_ODOM_STILL_YAW_DEG = 0.8;
+    const WORKFLOW_CACHE_KEY = 'g1d_slam_workflow_actions_v2';
+    const SCAN_SECTOR_DEFS = [
+      { id: 'front', label: '\u524d\u65b9', from: -25, to: 25, warn: 0.80, danger: 0.45 },
+      { id: 'left_front', label: '\u5de6\u524d', from: 25, to: 90, warn: 0.65, danger: 0.40 },
+      { id: 'right_front', label: '\u53f3\u524d', from: -90, to: -25, warn: 0.65, danger: 0.40 },
+      { id: 'left_rear', label: '\u5de6\u540e', from: 90, to: 160, warn: 0.45, danger: 0.30 },
+      { id: 'right_rear', label: '\u53f3\u540e', from: -160, to: -90, warn: 0.45, danger: 0.30 },
+      { id: 'rear', label: '\u540e\u65b9', from: 160, to: -160, wrap: true, warn: 0.45, danger: 0.30 }
+    ];
 
     function resizeCanvas(canvas) {
       const rect = canvas.getBoundingClientRect();
@@ -2327,12 +3281,241 @@ HTML = r"""<!doctype html>
       return normalizeAngle(angle) * 180 / Math.PI;
     }
 
+    function normalizeDeg(deg) {
+      let v = Number(deg);
+      while (v > 180) v -= 360;
+      while (v <= -180) v += 360;
+      return v;
+    }
+
+    function angleInSector(deg, sector) {
+      const v = normalizeDeg(deg);
+      if (sector.wrap) return v >= sector.from || v <= sector.to;
+      return v >= sector.from && v <= sector.to;
+    }
+
+    function targetRelativeDeg(state) {
+      const waypoint = state?.navigation?.last_command?.waypoints?.[0];
+      const odom = state?.odom;
+      if (!waypoint || !odom || !Number.isFinite(Number(odom.x)) || !Number.isFinite(Number(odom.y)) || !Number.isFinite(Number(odom.yaw))) return null;
+      const heading = Math.atan2(Number(waypoint.y) - Number(odom.y), Number(waypoint.x) - Number(odom.x));
+      return normalizeDeg((heading - Number(odom.yaw)) * 180 / Math.PI);
+    }
+
+    function analyzeScan(state) {
+      const scan = state?.scan;
+      const result = { ok: false, status: 'waiting', label: '\u7b49\u5f85\u6fc0\u5149\u6570\u636e', minRange: null, minAngleDeg: null, sectors: [], target: null, dangerCount: 0, warnCount: 0 };
+      if (!scan || !Array.isArray(scan.ranges)) return result;
+      const sectors = SCAN_SECTOR_DEFS.map(def => ({ ...def, minRange: null, minAngleDeg: null, point: null, count: 0, status: 'ok' }));
+      const targetDeg = targetRelativeDeg(state);
+      const target = targetDeg === null ? null : { label: '\u76ee\u6807\u65b9\u5411', centerDeg: targetDeg, halfDeg: 10, minRange: null, minAngleDeg: null, point: null, count: 0, status: 'ok', warn: 0.80, danger: 0.45 };
+      for (let i = 0; i < scan.ranges.length; i++) {
+        const r = Number(scan.ranges[i]);
+        if (!Number.isFinite(r) || r <= 0) continue;
+        const angle = Number(scan.angle_min) + i * Number(scan.angle_increment);
+        const deg = normalizeDeg(angle * 180 / Math.PI);
+        const point = { x: r * Math.cos(angle), y: r * Math.sin(angle), angle, deg, range: r };
+        if (result.minRange === null || r < result.minRange) { result.minRange = r; result.minAngleDeg = deg; }
+        for (const sector of sectors) {
+          if (!angleInSector(deg, sector)) continue;
+          sector.count += 1;
+          if (sector.minRange === null || r < sector.minRange) { sector.minRange = r; sector.minAngleDeg = deg; sector.point = point; }
+        }
+        if (target) {
+          const diff = Math.abs(normalizeDeg(deg - target.centerDeg));
+          if (diff <= target.halfDeg) {
+            target.count += 1;
+            if (target.minRange === null || r < target.minRange) { target.minRange = r; target.minAngleDeg = deg; target.point = point; }
+          }
+        }
+      }
+      for (const sector of sectors) {
+        if (sector.minRange !== null && sector.minRange <= sector.danger) { sector.status = 'danger'; result.dangerCount += 1; }
+        else if (sector.minRange !== null && sector.minRange <= sector.warn) { sector.status = 'warn'; result.warnCount += 1; }
+      }
+      if (target) {
+        if (target.minRange !== null && target.minRange <= target.danger) target.status = 'danger';
+        else if (target.minRange !== null && target.minRange <= target.warn) target.status = 'warn';
+      }
+      result.ok = true;
+      result.sectors = sectors;
+      result.target = target;
+      if (result.dangerCount > 0 || target?.status === 'danger') { result.status = 'danger'; result.label = '\u8fd1\u969c\u788d\u5371\u9669'; }
+      else if (result.warnCount > 0 || target?.status === 'warn') { result.status = 'warn'; result.label = '\u8fd1\u969c\u788d\u6ce8\u610f'; }
+      else { result.status = 'ok'; result.label = '\u6fc0\u5149\u8fd1\u969c\u788d\u6b63\u5e38'; }
+      return result;
+    }
+
+    function renderScanAlert(analysis) {
+      const el = document.getElementById('scanAlert');
+      if (!el) return;
+      if (!analysis?.ok) { el.innerHTML = '<div class="scan-alert-summary">\u7b49\u5f85 Laser Scan \u6570\u636e</div>'; return; }
+      const sectorCards = analysis.sectors.map(sector => {
+        const rangeText = sector.minRange === null ? '--' : `${sector.minRange.toFixed(2)} m`;
+        const angleText = sector.minAngleDeg === null ? '--' : `${sector.minAngleDeg.toFixed(0)}\u00b0`;
+        const statusText = sector.status === 'danger' ? '\u5371\u9669' : (sector.status === 'warn' ? '\u6ce8\u610f' : 'OK');
+        return `<div class="scan-sector-card ${sector.status}"><div class="scan-sector-title"><span>${sector.label}</span><span>${statusText}</span></div><div class="scan-sector-meta">\u6700\u8fd1 ${rangeText} / ${angleText}</div><div class="scan-sector-meta">\u9ec4&lt;=${sector.warn.toFixed(2)}m\u3000\u7ea2&lt;=${sector.danger.toFixed(2)}m</div></div>`;
+      }).join('');
+      const target = analysis.target;
+      const targetText = target ? `\u76ee\u6807\u65b9\u5411 ${target.centerDeg.toFixed(0)}\u00b0\uff0c\u00b1${target.halfDeg}\u00b0 \u5185\u6700\u8fd1 ${target.minRange === null ? '--' : target.minRange.toFixed(2) + 'm'}` : '\u6ca1\u6709\u6b63\u5728\u6267\u884c\u7684\u76ee\u6807\u65b9\u5411';
+      el.innerHTML = `<div class="scan-alert-summary ${analysis.status}"><strong>${analysis.label}</strong>\uff1a\u8fd9\u662f\u9875\u9762\u57fa\u4e8e Laser Scan \u7684\u8bca\u65ad\u9608\u503c\uff0c\u4e0d\u7b49\u540c\u4e8e Slamware \u5185\u90e8\u62a5\u8b66\u3002${targetText}</div><div class="scan-sector-grid">${sectorCards}</div>`;
+    }
+
+    function faultReasonText(reason) {
+      const map = {
+        navigation_start: '开始导航',
+        navigation_start_blocked: '开始前安全检查失败',
+        raw_navigation_start: '裸控导航开始',
+        raw_navigation_start_blocked: '裸控导航被拒绝',
+        navigation_cancel: '停止/取消导航',
+        global_plan_zero: '规划路径为 0',
+        odom_still_during_navigation: '里程计 3 秒不动',
+        movement_after_cancel: '停止后仍有位姿变化',
+        sensor_impact: '传感器触发',
+        laser_close_during_navigation: '导航中激光近障碍',
+        frontend_navigation_stall: '前端判定导航卡住',
+        frontend_navigation_timeout: '前端等待导航超时',
+        manual_fault_snapshot: '手动记录'
+      };
+      return map[reason] || reason || '--';
+    }
+
+    function faultSeverityClass(snapshot) {
+      const reason = snapshot?.reason || '';
+      const hits = snapshot?.sensors?.hits || [];
+      const scanMin = Number(snapshot?.scan?.min_range);
+      if (reason.includes('blocked') || reason.includes('impact') || reason.includes('movement_after_cancel') || hits.length || (Number.isFinite(scanMin) && scanMin <= 0.45)) return 'danger';
+      if (reason.includes('plan_zero') || reason.includes('odom_still') || reason.includes('laser_close') || (Number.isFinite(scanMin) && scanMin <= 0.80)) return 'warn';
+      return '';
+    }
+
+    function renderFaultSnapshots(state) {
+      const list = document.getElementById('faultSnapshotList');
+      const meta = document.getElementById('faultSnapshotMeta');
+      if (!list || !meta) return;
+      const snapshots = state.fault_snapshots || [];
+      meta.textContent = snapshots.length ? `${snapshots.length} 条 / 最新 #${snapshots[snapshots.length - 1]?.seq || '--'}` : '0 条';
+      if (!snapshots.length) {
+        list.innerHTML = '<div class="fault-empty">暂无快照。导航开始、plan=0、停止、传感器触发或手动记录时会出现在这里。</div>';
+        return;
+      }
+      list.innerHTML = snapshots.slice(-12).reverse().map(snap => {
+        const cls = faultSeverityClass(snap);
+        const cmd = snap.navigation?.last_command || {};
+        const plan = snap.navigation?.global_plan_path || {};
+        const odom = snap.odom || {};
+        const goal = snap.goal || {};
+        const scan = snap.scan || {};
+        const hits = snap.sensors?.hits || [];
+        const close = scan.close_counts || {};
+        const errors = snap.recent_slamware_errors?.lines || [];
+        const goalText = goal.target
+          ? `目标 (${fmt(goal.target.x, 3, 'm')}, ${fmt(goal.target.y, 3, 'm')}) / 距离 ${fmt(goal.distance_m, 3, 'm')} / 相对角 ${fmt(goal.bearing_robot_deg, 1, 'deg')}`
+          : '目标 --';
+        const hitText = hits.length
+          ? hits.map(h => `${h.sensor_type_name || h.sensor_type}#${h.id}${h.value !== null && h.value !== undefined ? '=' + h.value : ''}`).join('，')
+          : '无';
+        const closeText = `0.6m内 ${close.lt_0_6m ?? '--'}，0.8m内 ${close.lt_0_8m ?? '--'}`;
+        const errorText = errors.length ? escapeHtml(errors.slice(-4).join('\n')) : '无最近 Slamware 错误';
+        return `<div class="fault-item ${cls}">
+          <div class="fault-title"><span>#${snap.seq || '--'} ${escapeHtml(faultReasonText(snap.reason))}</span><small>${escapeHtml(snap.captured_at || '')}</small></div>
+          <div class="fault-grid">
+            <div>命令 <strong>${escapeHtml(cmd.type || '--')} #${cmd.seq || '--'}</strong></div>
+            <div>规划 <strong>${plan.total_poses ?? '--'} 点</strong></div>
+            <div>定位 <strong>${snap.navigation?.robot_basic_state?.localization_quality ?? '--'}</strong></div>
+            <div>位姿 <strong>${fmt(odom.x, 3, 'm')}, ${fmt(odom.y, 3, 'm')}, ${fmt(odom.yaw_deg, 1, 'deg')}</strong></div>
+            <div>激光最近 <strong>${fmt(scan.min_range, 3, 'm')}</strong></div>
+            <div>传感器 <strong>${escapeHtml(hitText)}</strong></div>
+            <div style="grid-column: 1 / -1;">${escapeHtml(goalText)}</div>
+            <div style="grid-column: 1 / -1;">近障碍统计：<strong>${escapeHtml(closeText)}</strong></div>
+          </div>
+          <pre class="fault-errors">${errorText}</pre>
+        </div>`;
+      }).join('');
+    }
+
     function makeActionId(prefix = 'act') {
       return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     }
 
+    function normalizeCachedAction(action) {
+      if (!action || typeof action !== 'object') return null;
+      const next = { ...action };
+      next.id = next.id || makeActionId(next.type || 'act');
+      return next;
+    }
+
+    function saveWorkflowCache() {
+      try {
+        window.localStorage.setItem(WORKFLOW_CACHE_KEY, JSON.stringify({
+          version: 2,
+          savedAt: Date.now(),
+          actions: workflowActions
+        }));
+      } catch (err) {
+        console.warn('failed to save workflow cache', err);
+      }
+    }
+
+    function loadWorkflowCache() {
+      try {
+        const raw = window.localStorage.getItem(WORKFLOW_CACHE_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        const actions = Array.isArray(parsed) ? parsed : parsed.actions;
+        if (!Array.isArray(actions)) return;
+        workflowActions = actions.map(normalizeCachedAction).filter(Boolean);
+      } catch (err) {
+        console.warn('failed to load workflow cache', err);
+      }
+    }
+
+    function clearWorkflowEditMode() {
+      editingActionId = null;
+      const btn = document.getElementById('addWorkflowActionBtn');
+      if (btn) btn.textContent = '\u589e\u52a0\u52a8\u4f5c';
+    }
+
+    function resolveWorkflowAction(action) {
+      if (!action || action.type !== 'navigate' || !action.pointId) return action;
+      const point = getSavedPointById(action.pointId);
+      if (!point) return { ...action, pointMissing: true };
+      return {
+        ...action,
+        title: `\u5bfc\u822a\u5230 ${point.name || '\u70b9\u4f4d'}`,
+        pointName: point.name || '',
+        x: Number(Number(point.x).toFixed(4)),
+        y: Number(Number(point.y).toFixed(4)),
+        yawDeg: Number(radToDeg(normalizeAngle(Number(point.yaw_deg || 0) * Math.PI / 180)).toFixed(3)),
+        pointMissing: false
+      };
+    }
+
+    function getResolvedWorkflowActions() {
+      return workflowActions.map(resolveWorkflowAction);
+    }
+
+    function refreshLinkedWorkflowActions() {
+      let changed = false;
+      workflowActions = workflowActions.map(action => {
+        const resolved = resolveWorkflowAction(action);
+        if (!resolved || resolved === action || resolved.pointMissing) return action;
+        const next = {
+          ...action,
+          title: resolved.title,
+          pointName: resolved.pointName,
+          x: resolved.x,
+          y: resolved.y,
+          yawDeg: resolved.yawDeg
+        };
+        if (JSON.stringify(next) !== JSON.stringify(action)) changed = true;
+        return next;
+      });
+      if (changed) saveWorkflowCache();
+    }
+
     function getNavigationActions() {
-      return workflowActions.filter(action => action.type === 'navigate');
+      return getResolvedWorkflowActions().filter(action => action.type === 'navigate');
     }
 
     function getLastNavigationAction() {
@@ -2369,17 +3552,21 @@ HTML = r"""<!doctype html>
       const action = getLastNavigationAction();
       if (!action) return false;
       action.yawDeg = Number(radToDeg(normalizeAngle(Number(yawDeg) * Math.PI / 180)).toFixed(3));
+      saveWorkflowCache();
       syncSelectedWaypointsFromActions();
       return true;
     }
 
     function addWorkflowAction(action) {
       workflowActions.push(action);
+      saveWorkflowCache();
       resetWorkflowAfterEdit();
     }
 
     function removeWorkflowAction(actionId) {
       workflowActions = workflowActions.filter(action => action.id !== actionId);
+      if (editingActionId === actionId) clearWorkflowEditMode();
+      saveWorkflowCache();
       resetWorkflowAfterEdit();
     }
 
@@ -2390,7 +3577,57 @@ HTML = r"""<!doctype html>
       if (from < 0 || to < 0) return;
       const [item] = workflowActions.splice(from, 1);
       workflowActions.splice(to, 0, item);
+      saveWorkflowCache();
       resetWorkflowAfterEdit();
+    }
+
+    function commitWorkflowAction(action) {
+      if (!editingActionId) {
+        addWorkflowAction(action);
+        return 'added';
+      }
+      const idx = workflowActions.findIndex(item => item.id === editingActionId);
+      action.id = editingActionId;
+      if (idx >= 0) {
+        workflowActions[idx] = action;
+      } else {
+        workflowActions.push(action);
+      }
+      clearWorkflowEditMode();
+      saveWorkflowCache();
+      resetWorkflowAfterEdit();
+      return 'edited';
+    }
+
+    function editWorkflowAction(actionId) {
+      if (workflowRun.running) return;
+      const action = workflowActions.find(item => item.id === actionId);
+      if (!action) return;
+      const resolved = resolveWorkflowAction(action);
+      editingActionId = actionId;
+      let type = resolved.type;
+      if (resolved.type === 'arm_task') {
+        const phase = String(resolved.phase || '').toUpperCase();
+        type = phase === 'PICK' ? 'arm_pick' : phase === 'PLACE' ? 'arm_place' : 'arm_reset';
+      }
+      document.getElementById('newActionType').value = type;
+      updateActionBuilderVisibility();
+      if (type === 'navigate') {
+        setActionPointSelection(resolved.pointId || '');
+        setActionPoseInputs(resolved.x, resolved.y, resolved.yawDeg, { keepPointSelection: Boolean(resolved.pointId) });
+        document.getElementById('newActionSpeedRatio').value = clampSpeedRatio(resolved.speedRatio, 1).toFixed(2);
+      } else if (type.startsWith('arm_')) {
+        const target = resolved.targetObject || resolved.target_object || 'XiongMao';
+        document.getElementById('newArmTargetObject').value = target;
+        document.getElementById('newArmTimeoutSec').value = Number(resolved.timeoutSec || 120).toFixed(0);
+      } else if (type === 'column_height') {
+        document.getElementById('newColumnTargetHeightM').value = Number(resolved.targetHeightM || 0).toFixed(3);
+        document.getElementById('newColumnTimeoutSec').value = Number(resolved.timeoutSec || 30).toFixed(0);
+      }
+      const btn = document.getElementById('addWorkflowActionBtn');
+      if (btn) btn.textContent = '\u4fdd\u5b58\u52a8\u4f5c';
+      const index = workflowActions.findIndex(item => item.id === actionId);
+      showNavMessage('', `\u52a8\u4f5c\u94fe\uff1a\u6b63\u5728\u7f16\u8f91\u7b2c <strong>${index + 1}</strong> \u4e2a\u52a8\u4f5c\uff0c\u4fee\u6539\u540e\u70b9\u201c\u4fdd\u5b58\u52a8\u4f5c\u201d`);
     }
 
     function setStatus(ok, text) {
@@ -2673,6 +3910,7 @@ HTML = r"""<!doctype html>
       ctx.fillStyle = '#fbfcfe';
       ctx.fillRect(0, 0, w, h);
       const scan = state.scan;
+      const analysis = analyzeScan(state);
       const cx = w / 2, cy = h * 0.58;
       const maxM = scan?.range_max ? Math.min(scan.range_max, 8) : 8;
       const scale = Math.min(w, h) * 0.42 / maxM;
@@ -2690,6 +3928,18 @@ HTML = r"""<!doctype html>
       ctx.lineTo(cx, cy - maxM * scale);
       ctx.stroke();
 
+      ctx.setLineDash([8, 5]);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#facc15';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 0.80 * scale, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.strokeStyle = '#ef4444';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 0.45 * scale, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
       ctx.fillStyle = '#2563eb';
       if (scan && scan.ranges) {
         for (let i = 0; i < scan.ranges.length; i++) {
@@ -2702,10 +3952,39 @@ HTML = r"""<!doctype html>
           const py = cy - x * scale;
           ctx.fillRect(px - 1.5, py - 1.5, 3, 3);
         }
+        if (analysis.ok) {
+          for (const sector of analysis.sectors) {
+            if (!sector.point || sector.status === 'ok') continue;
+            const px = cx - sector.point.y * scale;
+            const py = cy - sector.point.x * scale;
+            ctx.fillStyle = sector.status === 'danger' ? '#ef4444' : '#f59e0b';
+            ctx.beginPath();
+            ctx.arc(px, py, sector.status === 'danger' ? 7 : 5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = '#111827';
+            ctx.font = '12px system-ui';
+            ctx.fillText(`${sector.label} ${sector.minRange.toFixed(2)}m`, px + 8, py - 8);
+          }
+          if (analysis.target) {
+            const targetRad = analysis.target.centerDeg * Math.PI / 180;
+            ctx.strokeStyle = '#16a34a';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(cx, cy);
+            ctx.lineTo(cx - Math.sin(targetRad) * maxM * scale * 0.75, cy - Math.cos(targetRad) * maxM * scale * 0.75);
+            ctx.stroke();
+            ctx.fillStyle = '#16a34a';
+            ctx.font = '12px system-ui';
+            ctx.fillText(`\u76ee\u6807 ${analysis.target.centerDeg.toFixed(0)}\u00b0`, 12, h - 16);
+          }
+        }
       } else {
         ctx.fillStyle = '#66758a';
         ctx.fillText('waiting for laser scan', 16, 24);
       }
+      ctx.fillStyle = '#991b1b';
+      ctx.font = '12px system-ui';
+      ctx.fillText('\u7ea2\u5708<=0.45m  \u9ec4\u5708<=0.80m', 12, 20);
     }
 
     function renderSensors(state) {
@@ -2821,9 +4100,11 @@ HTML = r"""<!doctype html>
       document.getElementById('scanMin').textContent = fmt(state.scan?.min_range, 3, 'm');
       document.getElementById('scanFrame').textContent = state.scan?.frame_id || '--';
       document.getElementById('scanAge').textContent = fmt(state.freshness_s?.scan, 2, 's');
+      const scanAnalysis = analyzeScan(state);
       document.getElementById('scanMeta').textContent = state.scan
-        ? `${state.scan.count} rays, age ${fmt(state.freshness_s.scan, 2, 's')}`
+        ? `${state.scan.count} rays, age ${fmt(state.freshness_s.scan, 2, 's')} / ${scanAnalysis.label}`
         : 'waiting';
+      renderScanAlert(scanAnalysis);
       const cloud = state.point_cloud;
       document.getElementById('cloudTopic').textContent = cloud?.topic ? cloud.topic.split('/').filter(Boolean).slice(-1)[0] : '--';
       document.getElementById('cloudPoints').textContent = cloud ? `${cloud.sampled_points}/${cloud.total_points}` : '--';
@@ -2862,6 +4143,39 @@ HTML = r"""<!doctype html>
       navStatus.innerHTML = `导航：${parts.join('　')}`;
     }
 
+    function setRelocalizationMessage(kind, text) {
+      const el = document.getElementById('relocalizationStatus');
+      if (!el) return;
+      el.className = `nav-status ${kind || ''}`.trim();
+      el.innerHTML = text;
+    }
+
+    function renderRelocalizationStatus(data) {
+      if (!data?.ok) {
+        setRelocalizationMessage('bad', `重定位：状态读取失败 ${escapeHtml(data?.error || '')}`);
+        return;
+      }
+      const anchor = data.anchor;
+      const basic = data.robot_basic_state;
+      const last = data.last_relocalization_command;
+      const anchorText = anchor
+        ? `基准 x=${Number(anchor.x).toFixed(3)}m, y=${Number(anchor.y).toFixed(3)}m, yaw=${Number(anchor.yaw_deg || 0).toFixed(1)}°`
+        : '未保存开机基准';
+      const qualityText = basic ? `定位 ${basic.is_localization_enabled ? 'ON' : 'OFF'} / ${basic.localization_quality}` : '定位 --';
+      const lastText = last ? `上次 ${last.movement || '--'} 半径 ${Number(last.search_radius_m || 0).toFixed(2)}m #${last.seq || ''}` : '未执行';
+      setRelocalizationMessage(anchor ? '' : 'warn', `重定位：${anchorText}　${qualityText}　${lastText}`);
+    }
+
+    async function loadRelocalizationStatus() {
+      try {
+        const res = await fetch('/api/relocalization/status', { cache: 'no-store' });
+        const data = await res.json();
+        renderRelocalizationStatus(data);
+      } catch (err) {
+        setRelocalizationMessage('bad', `重定位：状态读取失败 ${escapeHtml(err)}`);
+      }
+    }
+
     async function tick() {
       try {
         const res = await fetch('/api/state', { cache: 'no-store' });
@@ -2872,6 +4186,7 @@ HTML = r"""<!doctype html>
         drawScan(state);
         drawCloud(state);
         renderSensors(state);
+        renderFaultSnapshots(state);
         updateReadouts(state);
         updateNavigationStatus(state);
         updateWorkflowProgress(state);
@@ -2890,7 +4205,8 @@ HTML = r"""<!doctype html>
           sensors: state.sensors,
           map: state.map ? { frame_id: state.map.frame_id, width: state.map.width, height: state.map.height, resolution: state.map.resolution, origin: state.map.origin } : null,
           navigation: state.navigation,
-          arm_control: state.arm_control
+          arm_control: state.arm_control,
+          fault_snapshots: state.fault_snapshots ? state.fault_snapshots.slice(-5) : []
         }, null, 2);
       } catch (err) {
         setStatus(false, `offline: ${err}`);
@@ -2908,6 +4224,8 @@ HTML = r"""<!doctype html>
       document.getElementById('clearHeadingBtn').disabled = busy;
       document.getElementById('headingDegInput').disabled = busy;
       document.getElementById('applyHeadingDegBtn').disabled = busy;
+      document.getElementById('saveRelocalizationAnchorBtn').disabled = busy;
+      document.getElementById('runRelocalizationBtn').disabled = busy;
     }
 
     function showNavMessage(kind, text) {
@@ -2931,6 +4249,87 @@ HTML = r"""<!doctype html>
       return data;
     }
 
+    async function saveRelocalizationAnchor() {
+      setRelocalizationMessage('', '重定位：正在保存当前 odom 为开机基准...');
+      const data = await postJson('/api/relocalization/save_anchor', { source: 'dashboard_button' });
+      if (!data.ok) {
+        setRelocalizationMessage('bad', `重定位：保存失败 ${escapeHtml(data.error || '')}`);
+        return;
+      }
+      renderRelocalizationStatus({
+        ok: true,
+        anchor: data.anchor,
+        robot_basic_state: lastState?.navigation?.robot_basic_state,
+        last_relocalization_command: lastState?.navigation?.last_relocalization_command
+      });
+    }
+
+    async function runRelocalization() {
+      const radius = Number(document.getElementById('relocalizationRadiusInput')?.value || 0.6);
+      const movement = document.getElementById('relocalizationMovementInput')?.value || 'NO_MOVE';
+      if (!Number.isFinite(radius) || radius <= 0) {
+        setRelocalizationMessage('bad', '重定位：请输入有效搜索半径');
+        return;
+      }
+      setRelocalizationMessage('', '重定位：正在发送 set_pose + recover_localization...');
+      document.getElementById('runRelocalizationBtn').disabled = true;
+      try {
+        const data = await postJson('/api/relocalization/run', {
+          search_radius_m: radius,
+          movement,
+          max_time_ms: 8000,
+          set_pose: true,
+          enable_localization: true
+        });
+        if (!data.ok) {
+          setRelocalizationMessage('bad', `重定位：执行失败 ${escapeHtml(data.error || '')}`);
+          return;
+        }
+        setRelocalizationMessage('warn', `重定位：已发送命令，方式 ${escapeHtml(movement)}，半径 ${radius.toFixed(2)}m；等待 Slamware 更新定位质量...`);
+        setTimeout(loadRelocalizationStatus, 1200);
+        setTimeout(loadRelocalizationStatus, 4000);
+        setTimeout(loadRelocalizationStatus, 8500);
+      } finally {
+        document.getElementById('runRelocalizationBtn').disabled = false;
+      }
+    }
+
+    async function logFaultSnapshot(reason, extra = {}) {
+      try {
+        const data = await postJson('/api/fault_snapshots/log', {
+          reason,
+          source: 'frontend',
+          workflow: workflowRun,
+          ...extra
+        });
+        if (data?.snapshot && lastState) {
+          lastState.fault_snapshots = [...(lastState.fault_snapshots || []), data.snapshot].slice(-80);
+          renderFaultSnapshots(lastState);
+        }
+        return data;
+      } catch (err) {
+        console.warn('fault snapshot failed', err);
+        return { ok: false, error: String(err) };
+      }
+    }
+
+    async function recordManualFaultSnapshot() {
+      const data = await logFaultSnapshot('manual_fault_snapshot', { note: 'button clicked on dashboard' });
+      showNavMessage(data.ok ? 'warn' : 'bad', data.ok
+        ? `快照：<strong>已记录</strong> #${data.snapshot?.seq || '--'}`
+        : `快照：<strong>记录失败</strong> ${data.error || ''}`);
+      tick();
+    }
+
+    async function clearFaultSnapshots() {
+      const data = await postJson('/api/fault_snapshots/clear', {});
+      if (data.ok && lastState) {
+        lastState.fault_snapshots = [];
+        renderFaultSnapshots(lastState);
+      }
+      showNavMessage(data.ok ? '' : 'bad', data.ok ? '快照：已清空页面缓存，落盘 jsonl 不删除。' : `快照：清空失败 ${data.error || ''}`);
+    }
+
     function sleepMs(ms) {
       return new Promise(resolve => setTimeout(resolve, ms));
     }
@@ -2946,13 +4345,16 @@ HTML = r"""<!doctype html>
     }
 
     function getWorkflowModules() {
-      return workflowActions.map((action, index) => {
+      const resolvedActions = getResolvedWorkflowActions();
+      const resolvedNavActions = resolvedActions.filter(action => action.type === 'navigate');
+      return resolvedActions.map((action, index) => {
         if (action.type === 'navigate') {
           return {
             ...action,
             title: action.title || '导航',
+            speedRatio: clampSpeedRatio(action.speedRatio, 1),
             index,
-            navIndex: getNavigationActions().findIndex(nav => nav.id === action.id)
+            navIndex: resolvedNavActions.findIndex(nav => nav.id === action.id)
           };
         }
         if (action.type === 'arm_task') {
@@ -3032,6 +4434,7 @@ HTML = r"""<!doctype html>
         'clearHeadingBtn',
         'headingDegInput',
         'applyHeadingDegBtn',
+        'navSpeedRatioInput',
         'directNoAvoidanceMode',
         'rawCmdVelNoAvoidanceMode',
         'addPointToNavBtn',
@@ -3040,6 +4443,7 @@ HTML = r"""<!doctype html>
         'newActionX',
         'newActionY',
         'newActionYawDeg',
+        'newActionSpeedRatio',
         'newArmTargetObject',
         'newArmTimeoutSec',
         'newColumnTargetHeightM',
@@ -3065,6 +4469,12 @@ HTML = r"""<!doctype html>
       return Math.abs(normalizeAngle((Number(aDeg) - Number(bDeg)) * Math.PI / 180) * 180 / Math.PI);
     }
 
+    function clampSpeedRatio(value, fallback = 1) {
+      const raw = Number(value);
+      const base = Number.isFinite(raw) ? raw : Number(fallback);
+      return Math.max(0.05, Math.min(1.0, Number.isFinite(base) ? base : 1));
+    }
+
     function navigationReachState(action, state = lastState) {
       const dist = distanceToAction(action, state);
       const distanceOk = dist !== null && dist <= NAV_REACH_DISTANCE_M;
@@ -3086,7 +4496,7 @@ HTML = r"""<!doctype html>
 
     function previousNavigationPose(actionIndex) {
       for (let i = actionIndex - 1; i >= 0; i--) {
-        const action = workflowActions[i];
+        const action = resolveWorkflowAction(workflowActions[i]);
         if (action?.type === 'navigate') return action;
       }
       return workflowRun.startPose;
@@ -3147,6 +4557,8 @@ HTML = r"""<!doctype html>
       finalHeadingPoint = null;
       manualHeadingDeg = null;
       draggedActionId = null;
+      clearWorkflowEditMode();
+      saveWorkflowCache();
       document.getElementById('headingDegInput').value = '';
       setHeadingMode(false);
       resetWorkflowRun('已清空动作');
@@ -3196,7 +4608,9 @@ HTML = r"""<!doctype html>
       if (action.type === 'navigate') {
         const yawText = Number.isFinite(Number(action.yawDeg)) ? `, yaw=${Number(action.yawDeg).toFixed(1)}°` : '';
         const pointText = action.pointName ? `，点位库：${action.pointName}` : '';
-        return `目标 x=${Number(action.x).toFixed(3)}m, y=${Number(action.y).toFixed(3)}m${yawText}${pointText}`;
+        const speedText = `，速度 ${clampSpeedRatio(action.speedRatio, 1).toFixed(2)}`;
+        const missingText = action.pointMissing ? '，点位库未找到，使用卡片缓存坐标' : '';
+        return `目标 x=${Number(action.x).toFixed(3)}m, y=${Number(action.y).toFixed(3)}m${yawText}${pointText}${speedText}${missingText}`;
       }
       if (action.type === 'fake_pick_xiongmao') {
         return `假动作模块：后端休眠 ${action.durationSec || 5}s，后续可替换为机械臂动作`;
@@ -3208,7 +4622,7 @@ HTML = r"""<!doctype html>
         return `ROS 手臂任务：phase=${phase}${targetText}，超时 ${action.timeoutSec || 120}s`;
       }
       if (action.type === 'column_height') {
-        return `G1D 立柱高度：target=${Number(action.targetHeightM || 0).toFixed(3)}m，超时 ${action.timeoutSec || 30}s`;
+        return `G1D 立柱 raw 高度：target=${Number(action.targetHeightM || 0).toFixed(3)}m，可填 -0.053~0.376m，超时 ${action.timeoutSec || 30}s`;
       }
       return '预留动作模块';
     }
@@ -3232,13 +4646,13 @@ HTML = r"""<!doctype html>
         const progress = workflowStepProgress(module, index);
         const badge = status === 'done' ? '完成' : status === 'running' ? '进行中' : status === 'error' ? '异常' : '等待';
         const draggable = workflowRun.running ? 'false' : 'true';
+        const editButton = workflowRun.running ? '' : `<button class="workflow-edit" data-edit-action-id="${escapeHtml(module.id)}">&#32534;&#36753;</button>`;
         const deleteButton = workflowRun.running ? '' : `<button class="workflow-delete" data-delete-action-id="${escapeHtml(module.id)}">删除</button>`;
         return `<div class="workflow-step ${status}" draggable="${draggable}" data-action-id="${escapeHtml(module.id)}" style="--progress:${progress}%">
           <div class="workflow-step-content">
             <div class="workflow-title">
               <span class="workflow-title-left"><span class="drag-handle">☰</span><span class="workflow-pulse"></span>${escapeHtml(actionTitle(module, index))}</span>
-              <span class="workflow-badge">${badge}</span>
-              ${deleteButton}
+              <span class="workflow-actions-inline"><span class="workflow-badge">${badge}</span>${editButton}${deleteButton}</span>
             </div>
             <div class="workflow-detail">${escapeHtml(actionDetail(module))}</div>
             <div class="workflow-progress-text">进度 ${progress}%</div>
@@ -3251,6 +4665,12 @@ HTML = r"""<!doctype html>
     function bindWorkflowListEvents() {
       const list = document.getElementById('workflowList');
       if (!list || workflowRun.running) return;
+      list.querySelectorAll('.workflow-edit').forEach(btn => {
+        btn.addEventListener('click', ev => {
+          ev.stopPropagation();
+          editWorkflowAction(btn.getAttribute('data-edit-action-id'));
+        });
+      });
       list.querySelectorAll('.workflow-delete').forEach(btn => {
         btn.addEventListener('click', ev => {
           ev.stopPropagation();
@@ -3310,6 +4730,7 @@ HTML = r"""<!doctype html>
       let lastOdom = null;
       let lastStateError = null;
       let sawNavigationEvidence = false;
+      let loggedPlanStall = false;
       while (workflowRun.running && Date.now() - started < timeoutMs) {
         let state;
         try {
@@ -3360,6 +4781,16 @@ HTML = r"""<!doctype html>
           : true;
         const planIdleOk = planIdleSince !== null && now - planIdleSince >= NAV_IDLE_STABLE_MS;
         const odomStillOk = odomStillSince !== null && now - odomStillSince >= NAV_IDLE_STABLE_MS;
+        if (!loggedPlanStall && planIdleOk && odomStillOk && !lastReach?.reached) {
+          loggedPlanStall = true;
+          await logFaultSnapshot('frontend_navigation_stall', {
+            action,
+            lastReach,
+            planCount,
+            planIdleMs: planIdleSince === null ? null : now - planIdleSince,
+            odomStillMs: odomStillSince === null ? null : now - odomStillSince
+          });
+        }
         if (planIdleOk && odomStillOk && idleDistanceOk && idleYawOk && (sawNavigationEvidence || now - started > 3000)) {
           if (!lastReach.reached) {
             const distText = `${(lastReach.dist * 1000).toFixed(0)}mm`;
@@ -3374,6 +4805,7 @@ HTML = r"""<!doctype html>
       if (lastStateError && !lastReach) throw new Error(`读取底盘状态失败：${lastStateError.message || lastStateError}`);
       const distText = lastReach?.dist === null || lastReach?.dist === undefined ? '--' : `${(lastReach.dist * 1000).toFixed(0)}mm`;
       const yawText = lastReach?.yawErrorDeg === null || lastReach?.yawErrorDeg === undefined ? '--' : `${lastReach.yawErrorDeg.toFixed(1)}°`;
+      await logFaultSnapshot('frontend_navigation_timeout', { action, lastReach, timeoutMs });
       throw new Error(`等待导航到达超时：距离偏差 ${distText}，yaw 偏差 ${yawText}`);
     }
 
@@ -3487,6 +4919,7 @@ HTML = r"""<!doctype html>
         if (editingPointId && !savedPoints.some(point => point.id === editingPointId)) {
           editingPointId = null;
         }
+        refreshLinkedWorkflowActions();
         renderSavedPoints();
         refreshActionPointOptions();
         document.getElementById('pointsMeta').textContent = `${savedPoints.length} saved`;
@@ -3683,6 +5116,7 @@ HTML = r"""<!doctype html>
         const y = selectedPoint ? Number(selectedPoint.y) : Number(document.getElementById('newActionY').value);
         const rawYaw = selectedPoint ? selectedPoint.yaw_deg : document.getElementById('newActionYawDeg').value;
         const yawDeg = rawYaw === '' || rawYaw === null || rawYaw === undefined ? (lastState?.odom?.yaw_deg || 0) : Number(rawYaw);
+        const speedRatio = clampSpeedRatio(document.getElementById('newActionSpeedRatio')?.value, 1);
         if (!Number.isFinite(x) || !Number.isFinite(y)) {
           showNavMessage('bad', '动作链：<strong>导航动作需要有效的 X / Y</strong>');
           return;
@@ -3691,7 +5125,7 @@ HTML = r"""<!doctype html>
           showNavMessage('bad', '动作链：<strong>导航动作需要有效的 yaw</strong>');
           return;
         }
-        addWorkflowAction({
+        const commitMode = commitWorkflowAction({
           id: makeActionId('nav'),
           type: 'navigate',
           title: selectedPoint ? `导航到 ${selectedPoint.name || '点位'}` : '导航',
@@ -3699,10 +5133,11 @@ HTML = r"""<!doctype html>
           pointName: selectedPoint?.name || '',
           x: Number(x.toFixed(4)),
           y: Number(y.toFixed(4)),
-          yawDeg: Number(radToDeg(normalizeAngle(yawDeg * Math.PI / 180)).toFixed(3))
+          yawDeg: Number(radToDeg(normalizeAngle(yawDeg * Math.PI / 180)).toFixed(3)),
+          speedRatio: Number(speedRatio.toFixed(3))
         });
         const sourceText = selectedPoint ? `（点位库：${escapeHtml(selectedPoint.name || 'Point')}）` : '';
-        showNavMessage('', `动作链：已增加导航动作${sourceText} x=${x.toFixed(3)}, y=${y.toFixed(3)}`);
+        showNavMessage('', `动作链：已${commitMode === 'edited' ? '保存' : '增加'}导航动作${sourceText} x=${x.toFixed(3)}, y=${y.toFixed(3)}`);
         return;
       }
       if (type.startsWith('arm_')) {
@@ -3730,15 +5165,19 @@ HTML = r"""<!doctype html>
           timeoutSec: Math.max(1, Math.min(600, Number(timeoutSec.toFixed(1))))
         };
         action.title = armActionTitle(action);
-        addWorkflowAction(action);
-        showNavMessage('', `动作链：已增加“${escapeHtml(action.title)}”`);
+        const commitMode = commitWorkflowAction(action);
+        showNavMessage('', `动作链：已${commitMode === 'edited' ? '保存' : '增加'}“${escapeHtml(action.title)}”`);
         return;
       }
       if (type === 'column_height') {
         const targetHeightM = Number(document.getElementById('newColumnTargetHeightM').value);
         const timeoutSec = Number(document.getElementById('newColumnTimeoutSec').value || 30);
         if (!Number.isFinite(targetHeightM)) {
-          showNavMessage('bad', '动作链：<strong>立柱升降需要有效目标高度</strong>');
+          showNavMessage('bad', '动作链：<strong>立柱升降需要有效 raw 目标高度</strong>');
+          return;
+        }
+        if (targetHeightM < -0.053 || targetHeightM > 0.376) {
+          showNavMessage('bad', '动作链：<strong>立柱 raw 闭环目标范围是 -0.053 ~ 0.376 m</strong>');
           return;
         }
         if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) {
@@ -3752,17 +5191,17 @@ HTML = r"""<!doctype html>
           targetHeightM: Number(targetHeightM.toFixed(4)),
           timeoutSec: Math.max(1, Math.min(180, Number(timeoutSec.toFixed(1))))
         };
-        addWorkflowAction(action);
-        showNavMessage('', `动作链：已增加“立柱升降” target=${action.targetHeightM.toFixed(3)}m`);
+        const commitMode = commitWorkflowAction(action);
+        showNavMessage('', `动作链：已${commitMode === 'edited' ? '保存' : '增加'}“立柱升降” raw target=${action.targetHeightM.toFixed(3)}m`);
         return;
       }
-      addWorkflowAction({
+      const commitMode = commitWorkflowAction({
         id: makeActionId('act'),
         type: 'fake_pick_xiongmao',
         title: '拾取熊猫烟',
         durationSec: 5
       });
-      showNavMessage('', '动作链：已增加动作“拾取熊猫烟”');
+      showNavMessage('', `动作链：已${commitMode === 'edited' ? '保存' : '增加'}动作“拾取熊猫烟”`);
     }
 
     function setHeadingMode(enabled) {
@@ -3803,14 +5242,21 @@ HTML = r"""<!doctype html>
       showNavMessage('', `导航：已输入终点朝向 <strong>${manualHeadingDeg.toFixed(1)}°</strong>`);
     }
 
-    function buildNavigationPayload(waypoints = selectedWaypoints, yawDeg = null, yawSource = 'workflow_action') {
+    function buildNavigationPayload(waypoints = selectedWaypoints, yawDeg = null, yawSource = 'workflow_action', speedRatio = null) {
       const payload = { waypoints };
       const directNoAvoidanceMode = Boolean(document.getElementById('directNoAvoidanceMode')?.checked);
       const rawCmdVelNoAvoidanceMode = Boolean(document.getElementById('rawCmdVelNoAvoidanceMode')?.checked);
+      const resolvedSpeedRatio = clampSpeedRatio(
+        speedRatio !== null && speedRatio !== undefined ? speedRatio : document.getElementById('navSpeedRatioInput')?.value,
+        1
+      );
+      payload.speed_ratio = Number(resolvedSpeedRatio.toFixed(3));
       if (rawCmdVelNoAvoidanceMode) {
         payload.raw_cmd_vel = true;
         payload.disable_obstacle_avoidance = true;
         payload.navigation_mode = 'raw_cmd_vel_no_obstacle_avoidance';
+        payload.raw_linear_speed_mps = 0.35;
+        payload.raw_angular_speed_radps = 1.2;
       } else if (directNoAvoidanceMode) {
         payload.direct_no_avoidance = true;
         payload.navigation_mode = 'direct_key_points_stop_on_obstacle';
@@ -3843,7 +5289,12 @@ HTML = r"""<!doctype html>
       const modeText = rawCmdVelNoAvoidanceMode ? '裸控无避障（/cmd_vel）' : (directNoAvoidanceMode ? '直连不绕障（遇障停止）' : '普通避障');
       showNavMessage('', `导航：正在发送航点和目标角度... ${targetYaw ? targetYaw.yawDeg.toFixed(1) + '° ' + targetYaw.label : ''}，模式 ${modeText}`);
       try {
-        const data = await postJson('/api/navigation/start', buildNavigationPayload(waypoints, options.yawDeg, options.yawSource || 'workflow_action'));
+        const data = await postJson('/api/navigation/start', buildNavigationPayload(
+          waypoints,
+          options.yawDeg,
+          options.yawSource || 'workflow_action',
+          options.speedRatio
+        ));
         if (data.ok) {
           if (!options.fromWorkflow) {
             const firstNavIndex = getWorkflowModules().findIndex(action => action.type === 'navigate');
@@ -3899,7 +5350,8 @@ HTML = r"""<!doctype html>
               workflowMode: 'chain',
               waypoints: [{ x: Number(action.x), y: Number(action.y) }],
               yawDeg: action.yawDeg,
-              yawSource: 'workflow_action'
+              yawSource: 'workflow_action',
+              speedRatio: action.speedRatio
             });
             if (!navData.ok) {
               throw new Error(navData.error || '导航启动失败');
@@ -3935,7 +5387,7 @@ HTML = r"""<!doctype html>
             workflowRun.actionStartedAt = Date.now();
             workflowRun.actionDurationSec = action.timeoutSec || 30;
             renderWorkflow();
-            showNavMessage('', `动作链：正在执行第 ${index + 1} 步“立柱升降” target=${Number(action.targetHeightM || 0).toFixed(3)}m...`);
+            showNavMessage('', `动作链：正在执行第 ${index + 1} 步“立柱升降” raw target=${Number(action.targetHeightM || 0).toFixed(3)}m...`);
             const actionData = await postJson('/api/actions/execute', {
               type: 'column_height',
               target_height_m: Number(action.targetHeightM || 0),
@@ -4056,6 +5508,7 @@ HTML = r"""<!doctype html>
     });
     document.getElementById('clearWaypointsBtn').addEventListener('click', () => {
       workflowActions = workflowActions.filter(action => action.type !== 'navigate');
+      saveWorkflowCache();
       syncSelectedWaypointsFromActions();
       finalHeadingPoint = null;
       manualHeadingDeg = null;
@@ -4098,6 +5551,8 @@ HTML = r"""<!doctype html>
         : '导航：已关闭 <strong>裸控无避障</strong>。');
       tick();
     });
+    document.getElementById('saveRelocalizationAnchorBtn').addEventListener('click', saveRelocalizationAnchor);
+    document.getElementById('runRelocalizationBtn').addEventListener('click', runRelocalization);
     document.getElementById('startNavigationBtn').addEventListener('click', startNavigation);
     document.getElementById('runWorkflowBtn').addEventListener('click', runWorkflow);
     document.getElementById('stopNavigationBtn').addEventListener('click', stopNavigation);
@@ -4106,12 +5561,17 @@ HTML = r"""<!doctype html>
     document.getElementById('newActionPointSelect').addEventListener('change', onActionPointSelected);
     document.getElementById('fillCurrentPoseBtn').addEventListener('click', fillCurrentPoseForAction);
     document.getElementById('addWorkflowActionBtn').addEventListener('click', addActionFromBuilder);
-    document.getElementById('resetWorkflowBtn').addEventListener('click', () => resetWorkflowRun('待执行'));
+    document.getElementById('resetWorkflowBtn').addEventListener('click', () => {
+      clearWorkflowEditMode();
+      resetWorkflowRun('待执行');
+    });
     document.getElementById('recordCurrentPointBtn').addEventListener('click', recordCurrentPoint);
     document.getElementById('newPointBtn').addEventListener('click', clearPointForm);
     document.getElementById('savePointBtn').addEventListener('click', savePoint);
     document.getElementById('addPointToNavBtn').addEventListener('click', addEditedPointToNav);
     document.getElementById('deletePointBtn').addEventListener('click', deletePoint);
+    document.getElementById('manualFaultSnapshotBtn').addEventListener('click', recordManualFaultSnapshot);
+    document.getElementById('clearFaultSnapshotsBtn').addEventListener('click', clearFaultSnapshots);
 
     cloudCanvas.addEventListener('pointerdown', ev => {
       cloudDragging = true;
@@ -4131,9 +5591,12 @@ HTML = r"""<!doctype html>
 
     window.addEventListener('resize', () => { cachedMapSeq = -1; tick(); });
     setInterval(tick, 500);
+    setInterval(loadRelocalizationStatus, 5000);
+    loadWorkflowCache();
     updateActionBuilderVisibility();
     renderWorkflow();
     loadSavedPoints();
+    loadRelocalizationStatus();
     tick();
   </script>
 </body>
@@ -4157,6 +5620,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.write_json(self.state.snapshot())
         elif parsed.path == "/api/points":
             self.write_json(self.point_store.list_payload())
+        elif parsed.path == "/api/fault_snapshots":
+            self.write_json(self.node_ref.fault_logger.list_payload())
+        elif parsed.path in ("/api/relocalization/status", "/api/relocalization"):
+            self.write_json(self.node_ref.relocalization_status())
         elif parsed.path == "/api/health":
             snap = self.state.snapshot()
             self.write_json(
@@ -4173,6 +5640,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "has_global_plan_path": snap["navigation"]["global_plan_path"] is not None,
                     "has_robot_basic_state": snap["navigation"]["robot_basic_state"] is not None,
                     "has_arm_task_status": snap["arm_control"]["last_status"] is not None,
+                    "fault_snapshot_count": len(snap.get("fault_snapshots", [])),
                 }
             )
         else:
@@ -4207,6 +5675,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             self.write_json(self.node_ref.stop_all_actions(payload))
+        elif parsed.path == "/api/relocalization/save_anchor":
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.save_relocalization_anchor(payload))
+        elif parsed.path in ("/api/relocalization/run", "/api/relocalization/start"):
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.run_relocalization(payload))
+        elif parsed.path == "/api/fault_snapshots/log":
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.fault_logger.capture_manual(payload))
+        elif parsed.path == "/api/fault_snapshots/clear":
+            self.write_json(self.node_ref.fault_logger.clear())
         elif parsed.path == "/api/actions/execute":
             payload = self.read_json_body()
             if payload is None:
@@ -4297,6 +5782,9 @@ def main() -> int:
     parser.add_argument("--pointcloud-topic", action="append", default=["/ele_clouds"])
     parser.add_argument("--move-to-locations-topic", default="/slamware_ros_sdk_server_node/move_to_locations")
     parser.add_argument("--cancel-action-topic", default="/slamware_ros_sdk_server_node/cancel_action")
+    parser.add_argument("--set-pose-topic", default="/slamware_ros_sdk_server_node/set_pose")
+    parser.add_argument("--recover-localization-topic", default="/slamware_ros_sdk_server_node/recover_localization")
+    parser.add_argument("--set-map-localization-topic", default="/slamware_ros_sdk_server_node/set_map_localization")
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--global-plan-path-topic", default="/slamware_ros_sdk_server_node/global_plan_path")
     parser.add_argument("--robot-basic-state-topic", default="/slamware_ros_sdk_server_node/robot_basic_state")
@@ -4314,13 +5802,17 @@ def main() -> int:
     parser.add_argument("--column-control-interface", default="eth0")
     parser.add_argument("--column-control-libdir", default="/home/unitree/unitree_sdk2/thirdparty/lib/aarch64")
     parser.add_argument("--column-height-timeout-sec", type=float, default=30.0)
-    parser.add_argument("--column-height-min-m", type=float, default=-1.0)
-    parser.add_argument("--column-height-max-m", type=float, default=1.0)
+    parser.add_argument("--column-height-min-m", type=float, default=-0.053)
+    parser.add_argument("--column-height-max-m", type=float, default=0.376)
     parser.add_argument("--raw-nav-linear-speed-mps", type=float, default=0.12)
     parser.add_argument("--raw-nav-angular-speed-radps", type=float, default=0.45)
     parser.add_argument("--raw-nav-position-tolerance-m", type=float, default=0.08)
     parser.add_argument("--raw-nav-yaw-tolerance-deg", type=float, default=5.0)
     parser.add_argument("--points-file", default="data/nav_points.json")
+    parser.add_argument("--relocalization-anchor-file", default="data/relocalization_anchor.json")
+    parser.add_argument("--relocalization-search-radius-m", type=float, default=0.6)
+    parser.add_argument("--relocalization-max-time-ms", type=int, default=8000)
+    parser.add_argument("--relocalization-movement", default="NO_MOVE", choices=["NO_MOVE", "ROTATE_ONLY", "ANY"])
     parser.add_argument(
         "--min-localization-quality",
         type=int,
@@ -4329,10 +5821,12 @@ def main() -> int:
     )
     parser.add_argument("--max-cloud-points", type=int, default=6000)
     parser.add_argument("--max-track", type=int, default=1200)
+    parser.add_argument("--fault-log-path", default="data/navigation_fault_snapshots.jsonl")
     args = parser.parse_args()
 
     state = SharedState(max_track=args.max_track)
     point_store = SavedPointStore(args.points_file)
+    relocalization_store = RelocalizationAnchorStore(args.relocalization_anchor_file)
     rclpy.init()
     node = BaseSensorNode(
         state=state,
@@ -4343,6 +5837,9 @@ def main() -> int:
         pointcloud_topics=args.pointcloud_topic,
         move_to_locations_topic=args.move_to_locations_topic,
         cancel_action_topic=args.cancel_action_topic,
+        set_pose_topic=args.set_pose_topic,
+        recover_localization_topic=args.recover_localization_topic,
+        set_map_localization_topic=args.set_map_localization_topic,
         cmd_vel_topic=args.cmd_vel_topic,
         global_plan_path_topic=args.global_plan_path_topic,
         robot_basic_state_topic=args.robot_basic_state_topic,
@@ -4363,7 +5860,12 @@ def main() -> int:
         raw_nav_position_tolerance_m=args.raw_nav_position_tolerance_m,
         raw_nav_yaw_tolerance_deg=args.raw_nav_yaw_tolerance_deg,
         min_localization_quality=args.min_localization_quality,
+        relocalization_store=relocalization_store,
+        relocalization_search_radius_m=args.relocalization_search_radius_m,
+        relocalization_max_time_ms=args.relocalization_max_time_ms,
+        relocalization_movement=args.relocalization_movement,
         max_cloud_points=args.max_cloud_points,
+        fault_log_path=args.fault_log_path,
     )
 
     stop_event = threading.Event()
