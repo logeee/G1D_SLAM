@@ -59,6 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw-nav-yaw-tolerance-deg", type=float, default=5.0)
     parser.add_argument("--points-file", default="data/nav_points.json")
     parser.add_argument("--relocalization-anchor-file", default="data/relocalization_anchor.json")
+    parser.add_argument("--last-pose-file", default="data/last_pose.json")
+    parser.add_argument("--last-pose-save-interval-sec", type=float, default=10.0)
     parser.add_argument("--relocalization-search-radius-m", type=float, default=0.6)
     parser.add_argument("--relocalization-max-time-ms", type=int, default=8000)
     parser.add_argument("--relocalization-movement", default="NO_MOVE", choices=["NO_MOVE", "ROTATE_ONLY", "ANY"])

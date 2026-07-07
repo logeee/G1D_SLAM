@@ -101,6 +101,8 @@ class BaseSensorNode(Node):
         relocalization_movement: str,
         max_cloud_points: int,
         fault_log_path: str,
+        last_pose_file: str = "data/last_pose.json",
+        last_pose_save_interval_sec: float = 10.0,
     ) -> None:
         super().__init__("base_sensor_visual_server")
         self.state = state
@@ -111,6 +113,12 @@ class BaseSensorNode(Node):
         self.relocalization_search_radius_m = max(0.05, min(3.0, float(relocalization_search_radius_m)))
         self.relocalization_max_time_ms = max(1000, min(60000, int(relocalization_max_time_ms)))
         self.relocalization_movement = str(relocalization_movement or "NO_MOVE").strip().upper()
+        self.last_pose_file = FsPath(last_pose_file)
+        # 运行时可调:每隔 N 秒保存一次位姿(<=0 关闭自动保存)。saver 线程每秒读它。
+        try:
+            self.last_pose_save_interval_sec = float(last_pose_save_interval_sec)
+        except (TypeError, ValueError):
+            self.last_pose_save_interval_sec = 10.0
         self.set_pose_topic = str(set_pose_topic)
         self.recover_localization_topic = str(recover_localization_topic)
         self.set_map_localization_topic = str(set_map_localization_topic)
@@ -308,6 +316,129 @@ class BaseSensorNode(Node):
             command["seq"] = self.state.seq["relocalization_command"]
             self.state.last_relocalization_command = command
         return {"ok": True, "relocalization_started": not dry_run, "dry_run": dry_run, "command": command}
+
+    # ------------------------------------------------------------------
+    # 2D 重定位(LaserScan ↔ 占据栅格,自研):定时保存位姿 + 三种匹配 + 可选喂底盘
+    # ------------------------------------------------------------------
+    def save_last_pose(self) -> Optional[Dict[str, Any]]:
+        """把当前 odom 位姿覆盖写入 last_pose.json(供 json-初值 重定位读取)。"""
+        with self.state.lock:
+            odom = dict(self.state.odom) if self.state.odom else None
+        if not odom or odom.get("x") is None or odom.get("y") is None:
+            return None
+        record = {
+            "x": finite_or_none(odom.get("x"), 5),
+            "y": finite_or_none(odom.get("y"), 5),
+            "z": finite_or_none(odom.get("z"), 5) or 0.0,
+            "yaw": finite_or_none(odom.get("yaw"), 6),
+            "yaw_deg": finite_or_none(odom.get("yaw_deg"), 3),
+            "frame_id": str(odom.get("frame_id") or ""),
+            "saved_at": now_iso(),
+        }
+        try:
+            self.last_pose_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.last_pose_file.with_suffix(self.last_pose_file.suffix + ".tmp")
+            tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, self.last_pose_file)
+        except OSError:
+            return None
+        return record
+
+    def read_last_pose(self) -> Optional[Dict[str, Any]]:
+        try:
+            data = json.loads(self.last_pose_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict) or data.get("x") is None or data.get("y") is None:
+            return None
+        return data
+
+    def get_last_pose_config(self) -> Dict[str, Any]:
+        interval = float(self.last_pose_save_interval_sec)
+        return {
+            "ok": True,
+            "interval_sec": round(interval, 3),
+            "enabled": interval > 0,
+            "path": str(self.last_pose_file),
+            "last_pose": self.read_last_pose(),
+        }
+
+    def set_last_pose_interval(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """设置自动保存间隔(秒)。<=0 关闭;有效范围 [1, 3600]。"""
+        payload = payload or {}
+        raw = payload.get("interval_sec", payload.get("intervalSec"))
+        val = finite_or_none(raw, 3)
+        if val is None:
+            return {"ok": False, "error": "interval_sec 无效"}
+        val = float(val)
+        if val > 0:
+            val = max(1.0, min(3600.0, val))
+        else:
+            val = 0.0
+        self.last_pose_save_interval_sec = val
+        return self.get_last_pose_config()
+
+    def relocalize_2d(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """2D 重定位入口。
+        payload:
+          method: 'global' | 'json' | 'click'
+          init:   {x, y, yaw?}   (click 用;json 从文件读)
+          apply:  bool           (true 则 set_pose + recover_localization 喂底盘)
+          params: {...}          (可选,透传给 matcher)
+          rmse_accept: float
+        """
+        from ..reloc2d import matcher as reloc2d_matcher
+
+        payload = payload or {}
+        method = str(payload.get("method") or "").strip().lower()
+        apply_ = bool(payload.get("apply"))
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        rmse_accept = finite_or_none(payload.get("rmse_accept"), 4)
+        if rmse_accept is None:
+            rmse_accept = 0.15
+
+        with self.state.lock:
+            scan = dict(self.state.scan) if self.state.scan else None
+            mp = dict(self.state.map) if self.state.map else None
+        if not scan:
+            return {"ok": False, "error": "激光暂无数据 / no laser scan"}
+        if not mp:
+            return {"ok": False, "error": "地图暂无数据 / no map loaded"}
+
+        if method == "global":
+            algo, init = "global", None
+        elif method == "json":
+            init = self.read_last_pose()
+            if not init:
+                return {"ok": False, "error": "没有可用的 last_pose.json（等待定时保存或先跑一会儿）"}
+            algo = "two_stage"
+        elif method == "click":
+            init = payload.get("init") if isinstance(payload.get("init"), dict) else None
+            if not init or init.get("x") is None or init.get("y") is None:
+                return {"ok": False, "error": "点击初值缺少 x/y"}
+            algo = "two_stage"
+        else:
+            return {"ok": False, "error": f"未知 method: {method}"}
+
+        try:
+            result = reloc2d_matcher.relocalize(algo, scan, mp, init=init, params=params, rmse_accept=float(rmse_accept))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"匹配失败 / match failed: {exc}"}
+
+        result["ok"] = True
+        result["input_method"] = method
+        result["init"] = init
+        result["applied"] = False
+
+        if apply_:
+            pose = result["pose"]
+            apply_res = self.run_relocalization({
+                "anchor": {"x": pose["x"], "y": pose["y"], "yaw": pose["yaw"]},
+                "search_radius_m": params.get("apply_radius_m", self.relocalization_search_radius_m),
+            })
+            result["applied"] = bool(apply_res.get("ok") and not apply_res.get("dry_run"))
+            result["apply_result"] = apply_res
+        return result
 
     @staticmethod
     def _explorer_map_kind() -> MapKind:

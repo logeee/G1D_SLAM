@@ -27,6 +27,7 @@ from .api import navigation as navigation_api
 from .api import actions as actions_api
 from .api import mapping as mapping_api
 from .api import relocalization as relocalization_api
+from .api import reloc2d as reloc2d_api
 from .api import faults as faults_api
 
 
@@ -100,6 +101,8 @@ def _build_node(args):
         relocalization_movement=args.relocalization_movement,
         max_cloud_points=args.max_cloud_points,
         fault_log_path=args.fault_log_path,
+        last_pose_file=args.last_pose_file,
+        last_pose_save_interval_sec=args.last_pose_save_interval_sec,
     )
     return state, point_store, node
 
@@ -123,6 +126,28 @@ def create_app(args) -> FastAPI:
         ros_thread = threading.Thread(target=ros_spin, name="ros_spin", daemon=True)
         ros_thread.start()
 
+        # 每隔 N 秒把当前位姿覆盖写入 last_pose.json,供 2D 重定位的「json 初值」使用。
+        # 间隔挂在 node 上、运行时可经 /api/reloc2d/config 调整;这里每秒 tick 读取,
+        # 累计到间隔就存一次(node.last_pose_save_interval_sec<=0 时暂停)。
+        def pose_saver() -> None:
+            tick = 1.0
+            elapsed = 0.0
+            while not stop_event.wait(tick):
+                interval = float(getattr(node, "last_pose_save_interval_sec", 10.0) or 0.0)
+                if interval <= 0:
+                    elapsed = 0.0
+                    continue
+                elapsed += tick
+                if elapsed + 1e-6 >= interval:
+                    elapsed = 0.0
+                    try:
+                        node.save_last_pose()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        pose_thread = threading.Thread(target=pose_saver, name="last_pose_saver", daemon=True)
+        pose_thread.start()
+
         # Long arm tasks can hold a worker thread for minutes; give the pool room
         # so high-frequency /api/state polling never starves behind them.
         try:
@@ -136,6 +161,7 @@ def create_app(args) -> FastAPI:
         finally:
             stop_event.set()
             ros_thread.join(timeout=2.0)
+            pose_thread.join(timeout=2.0)
             try:
                 node.destroy_node()
             except Exception:  # noqa: BLE001
@@ -152,6 +178,7 @@ def create_app(args) -> FastAPI:
         actions_api,
         mapping_api,
         relocalization_api,
+        reloc2d_api,
         faults_api,
     ):
         app.include_router(module.router)

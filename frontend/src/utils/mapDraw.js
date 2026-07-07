@@ -245,7 +245,7 @@ export function drawMap(canvas, state, nav, metaRef) {
     ctx.restore()
   }
 
-  drawSavedPoints(ctx, map, geom, nav)
+  if (nav.showSavedPoints !== false) drawSavedPoints(ctx, map, geom, nav)
   drawSelectedWaypoints(ctx, map, geom, nav)
   drawTargetHeading(ctx, map, geom, nav)
 

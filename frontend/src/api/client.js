@@ -26,6 +26,7 @@ export const api = {
   getRelocalizationStatus: () => getJson('/api/relocalization/status'),
   getMappingStatus: () => getJson('/api/mapping/status'),
   getMappingList: () => getJson('/api/mapping/list'),
+  getReloc2dConfig: () => getJson('/api/reloc2d/config'),
   getHealth: () => getJson('/api/health'),
   post: postJson,
 }

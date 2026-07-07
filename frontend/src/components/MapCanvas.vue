@@ -9,7 +9,12 @@ import { canvasToMap, eventToCanvas } from '../utils/geometry.js'
 
 const props = defineProps({
   interactive: { type: Boolean, default: false },
+  // Pick mode: clicking reports the map-frame {x,y} via @pick instead of adding a waypoint.
+  pickMode: { type: Boolean, default: false },
+  // Whether to render saved nav points (hidden in Mapping Mode for a cleaner view).
+  showSavedPoints: { type: Boolean, default: true },
 })
+const emit = defineEmits(['pick'])
 
 const telemetry = useTelemetryStore()
 const workflow = useWorkflowStore()
@@ -31,19 +36,25 @@ function render() {
     finalHeadingPoint: finalHeadingPoint.value,
     manualHeadingDeg: manualHeadingDeg.value,
     targetYaw: workflow.computeTargetYaw(state.value),
+    showSavedPoints: props.showSavedPoints,
   }
   drawMap(canvas, state.value, nav)
 }
 
 function onClick(ev) {
-  if (!props.interactive) return
+  if (!props.interactive && !props.pickMode) return
   const st = state.value
   const geom = getCurrentMapGeom()
   if (!st?.map || !geom) return
   const c = eventToCanvas(canvasEl.value, ev)
   const p = canvasToMap(st.map, c.x, c.y, geom)
   if (!p) {
-    workflow.showNavMessage('bad', '导航：<strong>点在地图外</strong>')
+    if (props.pickMode) emit('pick', null)
+    else workflow.showNavMessage('bad', '导航：<strong>点在地图外</strong>')
+    return
+  }
+  if (props.pickMode) {
+    emit('pick', { x: p.x, y: p.y })
     return
   }
   workflow.handleMapClick(p, st?.odom?.yaw_deg || 0)
@@ -75,7 +86,7 @@ onBeforeUnmount(() => {
   <canvas
     ref="canvasEl"
     class="map-canvas"
-    :style="interactive ? null : { cursor: 'default' }"
+    :style="(interactive || pickMode) ? { cursor: 'crosshair' } : { cursor: 'default' }"
     @click="onClick"
   ></canvas>
 </template>
