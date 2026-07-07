@@ -24,6 +24,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path as FsPath
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
+import urllib.error
+import urllib.request
 
 import rclpy
 from geometry_msgs.msg import Point, Pose, Twist
@@ -812,6 +814,8 @@ class BaseSensorNode(Node):
         column_height_timeout_sec: float,
         column_height_min_m: float,
         column_height_max_m: float,
+        lift_height_url: str,
+        lift_height_timeout_sec: float,
         raw_nav_linear_speed_mps: float,
         raw_nav_angular_speed_radps: float,
         raw_nav_position_tolerance_m: float,
@@ -859,6 +863,8 @@ class BaseSensorNode(Node):
         self.column_height_timeout_sec = max(1.0, float(column_height_timeout_sec))
         self.column_height_min_m = float(column_height_min_m)
         self.column_height_max_m = float(column_height_max_m)
+        self.lift_height_url = str(lift_height_url or "").strip()
+        self.lift_height_timeout_sec = max(0.2, min(5.0, float(lift_height_timeout_sec)))
         self.raw_nav_linear_speed_mps = max(0.02, min(0.35, float(raw_nav_linear_speed_mps)))
         self.raw_nav_angular_speed_radps = max(0.05, min(1.2, float(raw_nav_angular_speed_radps)))
         self.raw_nav_position_tolerance_m = max(0.03, min(0.3, float(raw_nav_position_tolerance_m)))
@@ -1897,26 +1903,90 @@ class BaseSensorNode(Node):
             "message": "published navigation cancel and arm stop/reset commands",
         }
 
+    def read_lift_height_status(self) -> Dict[str, Any]:
+        url = self.lift_height_url
+        if not url:
+            return {"ok": False, "error": "lift height url is empty"}
+        started = time.time()
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=self.lift_height_timeout_sec) as resp:
+                body = resp.read(65536).decode("utf-8", "replace")
+                status_code = getattr(resp, "status", 200)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "url": url, "error": str(exc), "elapsed_ms": round((time.time() - started) * 1000.0, 1)}
+        try:
+            source_payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            return {"ok": False, "url": url, "http_status": status_code, "error": f"invalid json from lift height service: {exc}", "body_preview": body[:400], "elapsed_ms": round((time.time() - started) * 1000.0, 1)}
+        if not isinstance(source_payload, dict):
+            source_payload = {"value": source_payload}
+        def pick_m(*keys: str) -> Optional[float]:
+            for key in keys:
+                value = finite_or_none(source_payload.get(key))
+                if value is not None:
+                    return float(value)
+            return None
+        physical_height_m = pick_m("physical_height_m", "physicalHeightM", "height_m", "heightM")
+        hispeed_y_m = pick_m("hispeed_y_m", "raw_height_m", "rawHeightM", "sdk_height_m", "sdkHeightM")
+        lift_offset_m = pick_m("lift_offset_m", "offset_m", "offsetM")
+        full_travel_m = pick_m("full_travel_m", "fullTravelM")
+        sdk_min_m = pick_m("sdk_min_m", "sdkMinM")
+        sdk_max_m = pick_m("sdk_max_m", "sdkMaxM")
+        physical_min_m = pick_m("physical_min_m", "physicalMinM")
+        physical_max_m = pick_m("physical_max_m", "physicalMaxM")
+        if physical_height_m is None and hispeed_y_m is not None and lift_offset_m is not None:
+            physical_height_m = hispeed_y_m - lift_offset_m
+        if lift_offset_m is None and hispeed_y_m is not None and physical_height_m is not None:
+            lift_offset_m = hispeed_y_m - physical_height_m
+        if physical_min_m is None:
+            physical_min_m = 0.0
+        if physical_max_m is None and full_travel_m is not None:
+            physical_max_m = full_travel_m
+        if sdk_min_m is None and lift_offset_m is not None and physical_min_m is not None:
+            sdk_min_m = lift_offset_m + physical_min_m
+        if sdk_max_m is None and lift_offset_m is not None and physical_max_m is not None:
+            sdk_max_m = lift_offset_m + physical_max_m
+        def mm(value: Optional[float]) -> Optional[float]:
+            return round(value * 1000.0, 1) if value is not None and math.isfinite(value) else None
+        return {"ok": True, "url": url, "http_status": status_code, "source": source_payload.get("source") or source_payload.get("service") or "lift_height_service", "physical_height_m": finite_or_none(physical_height_m, 6), "physical_height_mm": mm(physical_height_m), "hispeed_y_m": finite_or_none(hispeed_y_m, 6), "hispeed_y_mm": mm(hispeed_y_m), "lift_offset_m": finite_or_none(lift_offset_m, 6), "lift_offset_mm": mm(lift_offset_m), "full_travel_m": finite_or_none(full_travel_m, 6), "full_travel_mm": mm(full_travel_m), "sdk_min_m": finite_or_none(sdk_min_m, 6), "sdk_max_m": finite_or_none(sdk_max_m, 6), "physical_min_m": finite_or_none(physical_min_m, 6), "physical_max_m": finite_or_none(physical_max_m, 6), "data_age_sec": finite_or_none(source_payload.get("data_age_sec"), 3), "timestamp": source_payload.get("timestamp"), "elapsed_ms": round((time.time() - started) * 1000.0, 1), "raw": source_payload}
+
     def execute_column_height_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        target = finite_or_none(
-            payload.get(
-                "target_height_m",
-                payload.get("targetHeightM", payload.get("height_m", payload.get("heightM"))),
-            ),
-            4,
-        )
+        lift_height_before: Optional[Dict[str, Any]] = None
+        target_source = "raw"
+        target_physical = finite_or_none(payload.get("target_physical_height_m", payload.get("targetPhysicalHeightM", payload.get("physical_height_m", payload.get("physicalHeightM")))), 4)
+        if target_physical is not None:
+            target_source = "physical"
+            lift_height_before = self.read_lift_height_status()
+            if not lift_height_before.get("ok"):
+                return {"ok": False, "error": "cannot read current lift offset for physical height control", "target_physical_height_m": target_physical, "lift_height": lift_height_before, "received": payload}
+            physical_min = finite_or_none(lift_height_before.get("physical_min_m")) or 0.0
+            physical_max = finite_or_none(lift_height_before.get("physical_max_m"))
+            full_travel = finite_or_none(lift_height_before.get("full_travel_m"))
+            if physical_max is None:
+                physical_max = full_travel if full_travel is not None else 0.427
+            if target_physical < physical_min - 0.002 or target_physical > physical_max + 0.002:
+                return {"ok": False, "error": f"target_physical_height_m out of range [{physical_min:.3f}, {physical_max:.3f}]", "target_physical_height_m": target_physical, "lift_height": lift_height_before, "received": payload}
+            lift_offset = finite_or_none(lift_height_before.get("lift_offset_m"))
+            if lift_offset is None:
+                hispeed_y = finite_or_none(lift_height_before.get("hispeed_y_m")); physical_now = finite_or_none(lift_height_before.get("physical_height_m"))
+                if hispeed_y is not None and physical_now is not None:
+                    lift_offset = hispeed_y - physical_now
+            if lift_offset is None:
+                return {"ok": False, "error": "lift_offset_m unavailable; cannot convert physical height to raw SDK target", "target_physical_height_m": target_physical, "lift_height": lift_height_before, "received": payload}
+            target = finite_or_none(target_physical + lift_offset, 4)
+        else:
+            target = finite_or_none(payload.get("target_height_m", payload.get("targetHeightM", payload.get("height_m", payload.get("heightM")))), 4)
+            if target is None:
+                return {"ok": False, "error": "target_physical_height_m or target_height_m is required", "received": payload}
         if target is None:
-            return {"ok": False, "error": "target_height_m is required", "received": payload}
-        if target < self.column_height_min_m or target > self.column_height_max_m:
-            return {
-                "ok": False,
-                "error": (
-                    f"target_height_m out of range "
-                    f"[{self.column_height_min_m:.3f}, {self.column_height_max_m:.3f}]"
-                ),
-                "target_height_m": target,
-                "received": payload,
-            }
+            return {"ok": False, "error": "converted raw target_height_m is invalid", "received": payload}
+        if target_source == "raw" and (target < self.column_height_min_m or target > self.column_height_max_m):
+            return {"ok": False, "error": (f"target_height_m out of range " f"[{self.column_height_min_m:.3f}, {self.column_height_max_m:.3f}]"), "target_height_m": target, "received": payload}
+        if target_source == "physical" and lift_height_before:
+            sdk_min = finite_or_none(lift_height_before.get("sdk_min_m")); sdk_max = finite_or_none(lift_height_before.get("sdk_max_m"))
+            if sdk_min is not None and sdk_max is not None and (target < sdk_min - 0.02 or target > sdk_max + 0.02):
+                return {"ok": False, "error": f"converted raw target_height_m out of SDK range [{sdk_min:.3f}, {sdk_max:.3f}]", "target_height_m": target, "target_physical_height_m": target_physical, "lift_height": lift_height_before, "received": payload}
         timeout = finite_or_none(payload.get("timeout_sec", payload.get("timeoutSec", self.column_height_timeout_sec)), 2)
         if timeout is None:
             timeout = self.column_height_timeout_sec
@@ -1942,8 +2012,12 @@ class BaseSensorNode(Node):
             "argv": argv,
             "cwd": workdir,
             "target_height_m": target,
+            "target_raw_height_m": target,
+            "target_physical_height_m": target_physical,
+            "target_source": target_source,
             "timeout_sec": timeout,
             "dry_run": dry_run,
+            "lift_height_before": lift_height_before,
         }
         if dry_run:
             return {
@@ -1986,6 +2060,7 @@ class BaseSensorNode(Node):
                 "finished_at": now_iso(),
             }
         ok = result.returncode == 0
+        lift_height_after = self.read_lift_height_status() if not dry_run else None
         return {
             "ok": ok,
             "error": None if ok else f"column height command failed with returncode {result.returncode}",
@@ -1996,6 +2071,8 @@ class BaseSensorNode(Node):
             "stderr": result.stderr,
             "started_at": started_at,
             "finished_at": now_iso(),
+            "lift_height_before": lift_height_before,
+            "lift_height_after": lift_height_after,
         }
 
     def start_navigation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2805,6 +2882,9 @@ HTML = r"""<!doctype html>
       background: #fff;
       color: var(--text);
     }
+    .column-height-status { grid-column: 1 / -1; border: 1px solid #bfdbfe; border-radius: 8px; background: #eff6ff; color: #1e3a8a; padding: 8px 10px; font-size: 12px; line-height: 1.45; }
+    .column-height-buttons { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+    .column-height-buttons button { min-height: 34px; }
     .action-builder-actions {
       display: flex;
       flex-wrap: wrap;
@@ -3448,13 +3528,18 @@ HTML = r"""<!doctype html>
               <label class="arm-action-field">超时 s
                 <input id="newArmTimeoutSec" type="number" step="1" min="1" max="600" value="120" />
               </label>
-              <label class="column-action-field">目标 raw 高度 m
-                <input id="newColumnTargetHeightM" type="number" step="0.001" min="-0.053" max="0.376" value="0" />
+              <label class="column-action-field">目标物理高度 m
+                <input id="newColumnTargetHeightM" type="number" step="0.001" min="0" max="0.427" value="0" />
               </label>
-              <label class="column-action-field">超时 s
+              <label class="column-action-field">?? s
                 <input id="newColumnTimeoutSec" type="number" step="1" min="1" max="180" value="30" />
               </label>
-              <div class="column-action-field workflow-detail">可填闭环目标：-0.053 ~ 0.376 m；当前遥控器最高实测 raw=0.3759m。</div>
+              <div class="column-action-field column-height-status" id="columnHeightStatus">当前立柱高度：--</div>
+              <div class="column-action-field column-height-buttons">
+                <button id="refreshColumnHeightBtn" type="button">刷新立柱高度</button>
+                <button id="fillCurrentColumnHeightBtn" type="button">填当前高度</button>
+              </div>
+              <div class="column-action-field workflow-detail">这里填写真实物理高度 0.000 ~ 0.427 m；执行时后端会按当前 offset 自动换算为 raw SDK 目标。</div>
             </div>
             <div class="action-builder-actions">
               <button id="fillCurrentPoseBtn">填当前位置</button>
@@ -3586,6 +3671,7 @@ HTML = r"""<!doctype html>
     let editingPointId = null;
     let workflowActions = [];
     let editingActionId = null;
+    let lastLiftHeight = null;
     let draggedActionId = null;
     let workflowRun = {
       running: false,
@@ -3998,8 +4084,10 @@ HTML = r"""<!doctype html>
         document.getElementById('newArmTargetObject').value = target;
         document.getElementById('newArmTimeoutSec').value = Number(resolved.timeoutSec || 120).toFixed(0);
       } else if (type === 'column_height') {
-        document.getElementById('newColumnTargetHeightM').value = Number(resolved.targetHeightM || 0).toFixed(3);
+        const physicalTarget = resolved.targetPhysicalHeightM ?? resolved.target_physical_height_m ?? resolved.targetHeightM ?? 0;
+        document.getElementById('newColumnTargetHeightM').value = Number(physicalTarget || 0).toFixed(3);
         document.getElementById('newColumnTimeoutSec').value = Number(resolved.timeoutSec || 30).toFixed(0);
+        refreshColumnHeightStatus({ quiet: true });
       }
       const btn = document.getElementById('addWorkflowActionBtn');
       if (btn) btn.textContent = '\u4fdd\u5b58\u52a8\u4f5c';
@@ -4793,6 +4881,50 @@ HTML = r"""<!doctype html>
       return data;
     }
 
+    function updateColumnHeightStatus(data) {
+      const el = document.getElementById('columnHeightStatus');
+      if (!el) return;
+      if (!data || data.ok === false) {
+        el.textContent = `当前立柱高度：读取失败 ${data?.error || ''}`;
+        return;
+      }
+      lastLiftHeight = data;
+      const physical = Number.isFinite(Number(data.physical_height_m)) ? Number(data.physical_height_m).toFixed(3) : '--';
+      const raw = Number.isFinite(Number(data.hispeed_y_m)) ? Number(data.hispeed_y_m).toFixed(3) : '--';
+      const offset = Number.isFinite(Number(data.lift_offset_m)) ? Number(data.lift_offset_m).toFixed(3) : '--';
+      const max = Number.isFinite(Number(data.physical_max_m)) ? Number(data.physical_max_m).toFixed(3) : (Number.isFinite(Number(data.full_travel_m)) ? Number(data.full_travel_m).toFixed(3) : '--');
+      const age = Number.isFinite(Number(data.data_age_sec)) ? `${Number(data.data_age_sec).toFixed(1)}s` : '--';
+      el.textContent = `当前立柱物理高度 ${physical} m（raw=${raw} m，offset=${offset} m，范围 0~${max} m，age=${age}）`;
+      const input = document.getElementById('newColumnTargetHeightM');
+      if (input && Number.isFinite(Number(data.physical_max_m))) input.max = Number(data.physical_max_m).toFixed(3);
+    }
+
+    async function refreshColumnHeightStatus({ quiet = false } = {}) {
+      try {
+        const res = await fetch('/api/lift_height', { cache: 'no-store' });
+        const data = await res.json();
+        updateColumnHeightStatus(data);
+        if (!quiet) showNavMessage(data.ok ? '' : 'bad', data.ok ? `立柱：当前物理高度 <strong>${Number(data.physical_height_m || 0).toFixed(3)}m</strong>` : `立柱：<strong>高度读取失败</strong> ${data.error || ''}`);
+        return data;
+      } catch (err) {
+        const data = { ok: false, error: String(err) };
+        updateColumnHeightStatus(data);
+        if (!quiet) showNavMessage('bad', `立柱：<strong>高度读取失败</strong> ${err}`);
+        return data;
+      }
+    }
+
+    async function fillCurrentColumnHeight() {
+      const data = lastLiftHeight?.ok ? lastLiftHeight : await refreshColumnHeightStatus({ quiet: true });
+      if (!data?.ok || !Number.isFinite(Number(data.physical_height_m))) {
+        showNavMessage('bad', `立柱：<strong>没有可用的当前物理高度</strong> ${data?.error || ''}`);
+        return;
+      }
+      const input = document.getElementById('newColumnTargetHeightM');
+      if (input) input.value = Number(data.physical_height_m).toFixed(3);
+      showNavMessage('', `立柱：已填当前物理高度 <strong>${Number(data.physical_height_m).toFixed(3)}m</strong>`);
+    }
+
     async function saveRelocalizationAnchor() {
       setRelocalizationMessage('', '重定位：正在保存当前 odom 为开机基准...');
       const data = await postJson('/api/relocalization/save_anchor', { source: 'dashboard_button' });
@@ -4913,6 +5045,8 @@ HTML = r"""<!doctype html>
           return {
             ...action,
             title: action.title || '立柱升降',
+            targetPhysicalHeightM: action.targetPhysicalHeightM ?? action.target_physical_height_m,
+            targetHeightM: action.targetHeightM ?? action.target_height_m,
             timeoutSec: action.timeoutSec || 30,
             index
           };
@@ -5166,7 +5300,11 @@ HTML = r"""<!doctype html>
         return `ROS 手臂任务：phase=${phase}${targetText}，超时 ${action.timeoutSec || 120}s`;
       }
       if (action.type === 'column_height') {
-        return `G1D 立柱 raw 高度：target=${Number(action.targetHeightM || 0).toFixed(3)}m，可填 -0.053~0.376m，超时 ${action.timeoutSec || 30}s`;
+        const physical = action.targetPhysicalHeightM ?? action.target_physical_height_m;
+        if (physical !== undefined && physical !== null) {
+          return `G1D 立柱物理高度：target=${Number(physical || 0).toFixed(3)}m，后端自动换算 raw，超时 ${action.timeoutSec || 30}s`;
+        }
+        return `G1D 立柱 raw 高度：target=${Number(action.targetHeightM || 0).toFixed(3)}m（旧动作），超时 ${action.timeoutSec || 30}s`;
       }
       return '预留动作模块';
     }
@@ -5650,6 +5788,7 @@ HTML = r"""<!doctype html>
       });
       document.getElementById('newArmTargetObject').disabled = !isArmPick;
       document.getElementById('fillCurrentPoseBtn').style.display = isNav ? '' : 'none';
+      if (isColumn) refreshColumnHeightStatus({ quiet: true });
     }
 
     function addActionFromBuilder() {
@@ -5714,14 +5853,15 @@ HTML = r"""<!doctype html>
         return;
       }
       if (type === 'column_height') {
-        const targetHeightM = Number(document.getElementById('newColumnTargetHeightM').value);
+        const targetPhysicalHeightM = Number(document.getElementById('newColumnTargetHeightM').value);
         const timeoutSec = Number(document.getElementById('newColumnTimeoutSec').value || 30);
-        if (!Number.isFinite(targetHeightM)) {
-          showNavMessage('bad', '动作链：<strong>立柱升降需要有效 raw 目标高度</strong>');
+        const maxPhysical = Number(lastLiftHeight?.physical_max_m ?? lastLiftHeight?.full_travel_m ?? 0.427);
+        if (!Number.isFinite(targetPhysicalHeightM)) {
+          showNavMessage('bad', '动作链：<strong>立柱升降需要有效物理目标高度</strong>');
           return;
         }
-        if (targetHeightM < -0.053 || targetHeightM > 0.376) {
-          showNavMessage('bad', '动作链：<strong>立柱 raw 闭环目标范围是 -0.053 ~ 0.376 m</strong>');
+        if (targetPhysicalHeightM < -0.002 || targetPhysicalHeightM > maxPhysical + 0.002) {
+          showNavMessage('bad', `动作链：<strong>立柱物理高度范围是 0.000 ~ ${maxPhysical.toFixed(3)} m</strong>`);
           return;
         }
         if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) {
@@ -5732,11 +5872,11 @@ HTML = r"""<!doctype html>
           id: makeActionId('column'),
           type: 'column_height',
           title: '立柱升降',
-          targetHeightM: Number(targetHeightM.toFixed(4)),
+          targetPhysicalHeightM: Number(targetPhysicalHeightM.toFixed(4)),
           timeoutSec: Math.max(1, Math.min(180, Number(timeoutSec.toFixed(1))))
         };
         const commitMode = commitWorkflowAction(action);
-        showNavMessage('', `动作链：已${commitMode === 'edited' ? '保存' : '增加'}“立柱升降” raw target=${action.targetHeightM.toFixed(3)}m`);
+        showNavMessage('', `动作链：已${commitMode === 'edited' ? '保存' : '增加'}“立柱升降” 物理高度=${action.targetPhysicalHeightM.toFixed(3)}m`);
         return;
       }
       const commitMode = commitWorkflowAction({
@@ -5931,13 +6071,23 @@ HTML = r"""<!doctype html>
             workflowRun.actionStartedAt = Date.now();
             workflowRun.actionDurationSec = action.timeoutSec || 30;
             renderWorkflow();
-            showNavMessage('', `动作链：正在执行第 ${index + 1} 步“立柱升降” raw target=${Number(action.targetHeightM || 0).toFixed(3)}m...`);
-            const actionData = await postJson('/api/actions/execute', {
+            const physicalTarget = action.targetPhysicalHeightM ?? action.target_physical_height_m;
+            const rawTarget = action.targetHeightM ?? action.target_height_m;
+            const targetText = physicalTarget !== undefined && physicalTarget !== null
+              ? `物理高度=${Number(physicalTarget || 0).toFixed(3)}m`
+              : `raw target=${Number(rawTarget || 0).toFixed(3)}m`;
+            showNavMessage('', `动作链：正在执行第 ${index + 1} 步“立柱升降” ${targetText}...`);
+            const payload = {
               type: 'column_height',
-              target_height_m: Number(action.targetHeightM || 0),
               timeout_sec: workflowRun.actionDurationSec,
               name: action.title || '立柱升降'
-            });
+            };
+            if (physicalTarget !== undefined && physicalTarget !== null) {
+              payload.target_physical_height_m = Number(physicalTarget || 0);
+            } else {
+              payload.target_height_m = Number(rawTarget || 0);
+            }
+            const actionData = await postJson('/api/actions/execute', payload);
             if (!actionData.ok) {
               throw new Error(actionData.error || '立柱升降执行失败');
             }
@@ -6139,6 +6289,8 @@ HTML = r"""<!doctype html>
     });
     cloudCanvas.addEventListener('pointerup', () => { cloudDragging = false; });
     cloudCanvas.addEventListener('pointerleave', () => { cloudDragging = false; });
+    document.getElementById('refreshColumnHeightBtn')?.addEventListener('click', () => refreshColumnHeightStatus());
+    document.getElementById('fillCurrentColumnHeightBtn')?.addEventListener('click', () => fillCurrentColumnHeight());
 
     window.addEventListener('resize', () => { cachedMapSeq = -1; tick(); });
     setInterval(tick, 500);
@@ -6148,6 +6300,7 @@ HTML = r"""<!doctype html>
     renderWorkflow();
     loadSavedPoints();
     loadRelocalizationStatus();
+    refreshColumnHeightStatus({ quiet: true });
     tick();
   </script>
 </body>
@@ -6171,6 +6324,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.write_json(self.state.snapshot())
         elif parsed.path == "/api/points":
             self.write_json(self.point_store.list_payload())
+        elif parsed.path in ("/api/lift_height", "/api/column_height/current"):
+            self.write_json(self.node_ref.read_lift_height_status())
         elif parsed.path == "/api/fault_snapshots":
             self.write_json(self.node_ref.fault_logger.list_payload())
         elif parsed.path in ("/api/relocalization/status", "/api/relocalization"):
@@ -6388,6 +6543,8 @@ def main() -> int:
     parser.add_argument("--column-height-timeout-sec", type=float, default=30.0)
     parser.add_argument("--column-height-min-m", type=float, default=-0.053)
     parser.add_argument("--column-height-max-m", type=float, default=0.376)
+    parser.add_argument("--lift-height-url", default="http://127.0.0.1:28089/api/basic_status")
+    parser.add_argument("--lift-height-timeout-sec", type=float, default=1.0)
     parser.add_argument("--raw-nav-linear-speed-mps", type=float, default=0.12)
     parser.add_argument("--raw-nav-angular-speed-radps", type=float, default=0.45)
     parser.add_argument("--raw-nav-position-tolerance-m", type=float, default=0.08)
@@ -6446,6 +6603,8 @@ def main() -> int:
         column_height_timeout_sec=args.column_height_timeout_sec,
         column_height_min_m=args.column_height_min_m,
         column_height_max_m=args.column_height_max_m,
+        lift_height_url=args.lift_height_url,
+        lift_height_timeout_sec=args.lift_height_timeout_sec,
         raw_nav_linear_speed_mps=args.raw_nav_linear_speed_mps,
         raw_nav_angular_speed_radps=args.raw_nav_angular_speed_radps,
         raw_nav_position_tolerance_m=args.raw_nav_position_tolerance_m,
