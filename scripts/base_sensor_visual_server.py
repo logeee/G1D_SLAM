@@ -6373,8 +6373,8 @@ def main() -> int:
     parser.add_argument("--global-plan-path-topic", default="/slamware_ros_sdk_server_node/global_plan_path")
     parser.add_argument("--robot-basic-state-topic", default="/slamware_ros_sdk_server_node/robot_basic_state")
     parser.add_argument("--slamware-state-topic", default="/slamware_ros_sdk_server_node/state")
-    parser.add_argument("--arm-command-topic", default="/arm_control_refactor/task_command")
-    parser.add_argument("--arm-status-topic", default="/arm_control_refactor/task_status")
+    parser.add_argument("--arm-command-topic", default="/arm_control/task_command")
+    parser.add_argument("--arm-status-topic", default="/arm_control/task_status")
     parser.add_argument("--arm-task-timeout-sec", type=float, default=120.0)
     parser.add_argument(
         "--arm-stop-phases",
