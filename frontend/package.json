@@ -1,0 +1,20 @@
+{
+  "name": "g1d-slam-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Vue3 frontend for the G1D SLAM base sensor dashboard (migrated from the embedded HTML in base_sensor_visual_server.py).",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "pinia": "^3.0.4",
+    "vue": "^3.5.39"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.7",
+    "vite": "^8.1.3"
+  }
+}
