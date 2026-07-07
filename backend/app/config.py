@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--column-control-libdir", default="/home/unitree/unitree_sdk2/thirdparty/lib/aarch64")
     # Manual teleop jog of the base (mirrors the proven :18086 g1d_simple_control path).
     parser.add_argument("--base-control-bin", default="/home/unitree/unitree_sdk2/build/bin/g1d_simple_control")
-    parser.add_argument("--jog-max-linear-mps", type=float, default=0.15)
+    parser.add_argument("--jog-max-linear-mps", type=float, default=0.25)
     parser.add_argument("--jog-max-angular-radps", type=float, default=0.6)
     parser.add_argument("--jog-default-linear-mps", type=float, default=0.1)
     parser.add_argument("--jog-default-angular-radps", type=float, default=0.3)

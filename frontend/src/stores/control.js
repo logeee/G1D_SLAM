@@ -13,7 +13,7 @@ const HEARTBEAT_MS = 300
 
 export const useControlStore = defineStore('control', () => {
   // 滑条上限(可被后端 status 覆盖)
-  const maxLinear = ref(0.15) // m/s
+  const maxLinear = ref(0.25) // m/s
   const maxAngular = ref(0.6) // rad/s
   // 当前滑条值(用户可调)
   const linearSpeed = ref(0.1) // m/s
