@@ -24,6 +24,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path as FsPath
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
+import urllib.error
+import urllib.request
 
 import rclpy
 from geometry_msgs.msg import Point, Pose, Twist
@@ -34,12 +36,17 @@ from sensor_msgs.msg import LaserScan, PointCloud2
 from slamware_ros_sdk.msg import (
     BasicSensorValueDataArray,
     CancelActionRequest,
+    ClearMapRequest,
     LocalizationMovement,
+    MapKind,
     MoveToLocationsRequest,
     RecoverLocalizationRequest,
     RobotBasicState,
     SetMapLocalizationRequest,
+    SetMapUpdateRequest,
+    SyncMapRequest,
 )
+from slamware_ros_sdk.srv import SyncGetStcm, SyncSetStcm
 from std_msgs.msg import String
 
 
@@ -785,6 +792,13 @@ class BaseSensorNode(Node):
         set_pose_topic: str,
         recover_localization_topic: str,
         set_map_localization_topic: str,
+        set_map_update_topic: str,
+        clear_map_topic: str,
+        sync_get_stcm_service: str,
+        sync_set_stcm_service: str,
+        maps_dir: str,
+        sync_get_stcm_timeout_sec: float,
+        sync_set_stcm_timeout_sec: float,
         cmd_vel_topic: str,
         global_plan_path_topic: str,
         robot_basic_state_topic: str,
@@ -800,6 +814,8 @@ class BaseSensorNode(Node):
         column_height_timeout_sec: float,
         column_height_min_m: float,
         column_height_max_m: float,
+        lift_height_url: str,
+        lift_height_timeout_sec: float,
         raw_nav_linear_speed_mps: float,
         raw_nav_angular_speed_radps: float,
         raw_nav_position_tolerance_m: float,
@@ -824,6 +840,16 @@ class BaseSensorNode(Node):
         self.set_pose_topic = str(set_pose_topic)
         self.recover_localization_topic = str(recover_localization_topic)
         self.set_map_localization_topic = str(set_map_localization_topic)
+        self.set_map_update_topic = str(set_map_update_topic)
+        self.clear_map_topic = str(clear_map_topic)
+        self.sync_get_stcm_service = str(sync_get_stcm_service)
+        self.sync_set_stcm_service = str(sync_set_stcm_service)
+        self.maps_dir = FsPath(maps_dir)
+        self.sync_get_stcm_timeout_sec = max(3.0, min(120.0, float(sync_get_stcm_timeout_sec)))
+        self.sync_set_stcm_timeout_sec = max(3.0, min(120.0, float(sync_set_stcm_timeout_sec)))
+        self.last_mapping_command: Optional[Dict[str, Any]] = None
+        self.last_map_save: Optional[Dict[str, Any]] = None
+        self.last_map_load: Optional[Dict[str, Any]] = None
         self.arm_command_topic = arm_command_topic
         self.arm_status_topic = arm_status_topic
         self.arm_task_timeout_sec = max(1.0, float(arm_task_timeout_sec))
@@ -837,6 +863,8 @@ class BaseSensorNode(Node):
         self.column_height_timeout_sec = max(1.0, float(column_height_timeout_sec))
         self.column_height_min_m = float(column_height_min_m)
         self.column_height_max_m = float(column_height_max_m)
+        self.lift_height_url = str(lift_height_url or "").strip()
+        self.lift_height_timeout_sec = max(0.2, min(5.0, float(lift_height_timeout_sec)))
         self.raw_nav_linear_speed_mps = max(0.02, min(0.35, float(raw_nav_linear_speed_mps)))
         self.raw_nav_angular_speed_radps = max(0.05, min(1.2, float(raw_nav_angular_speed_radps)))
         self.raw_nav_position_tolerance_m = max(0.03, min(0.3, float(raw_nav_position_tolerance_m)))
@@ -872,6 +900,14 @@ class BaseSensorNode(Node):
         self.set_pose_pub = self.create_publisher(Pose, set_pose_topic, qos)
         self.recover_localization_pub = self.create_publisher(RecoverLocalizationRequest, recover_localization_topic, qos)
         self.set_map_localization_pub = self.create_publisher(SetMapLocalizationRequest, set_map_localization_topic, qos)
+        self.set_map_update_pub = self.create_publisher(SetMapUpdateRequest, set_map_update_topic, qos)
+        self.clear_map_pub = self.create_publisher(ClearMapRequest, clear_map_topic, qos)
+        self.sync_map_topic = (
+            clear_map_topic.rsplit("/", 1)[0] + "/sync_map" if "/" in clear_map_topic else "sync_map"
+        )
+        self.sync_map_pub = self.create_publisher(SyncMapRequest, self.sync_map_topic, qos)
+        self.sync_get_stcm_client = self.create_client(SyncGetStcm, sync_get_stcm_service)
+        self.sync_set_stcm_client = self.create_client(SyncSetStcm, sync_set_stcm_service)
         self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, qos)
         self.arm_task_command_pub = self.create_publisher(String, arm_command_topic, qos)
         self.get_logger().info(
@@ -998,6 +1034,299 @@ class BaseSensorNode(Node):
             command["seq"] = self.state.seq["relocalization_command"]
             self.state.last_relocalization_command = command
         return {"ok": True, "relocalization_started": not dry_run, "dry_run": dry_run, "command": command}
+
+    @staticmethod
+    def _explorer_map_kind() -> MapKind:
+        kind = MapKind()
+        kind.kind = int(MapKind.EXPLORERMAP)
+        return kind
+
+    def start_mapping(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        clear_value = payload.get("clear", True)
+        clear = not (clear_value is False or str(clear_value).strip().lower() in ("false", "0", "no", "off"))
+        if clear:
+            # A previously loaded map is "held" by localization mode, so a bare
+            # clear_map has no effect. Release it first (localization off + map
+            # update off), then clear, then re-enter SLAM (map update + localization on).
+            loc_off = SetMapLocalizationRequest()
+            loc_off.enabled = False
+            self.set_map_localization_pub.publish(loc_off)
+            time.sleep(0.3)
+
+            update_off = SetMapUpdateRequest()
+            update_off.enabled = False
+            update_off.kind = self._explorer_map_kind()
+            self.set_map_update_pub.publish(update_off)
+            time.sleep(0.3)
+
+            clear_msg = ClearMapRequest()
+            clear_msg.kind = self._explorer_map_kind()
+            self.clear_map_pub.publish(clear_msg)
+            time.sleep(0.5)
+
+            # The ROS map worker updates incrementally, so it keeps publishing the
+            # cached grid after a clear. Force a full resync to reflect the wipe.
+            self.sync_map_pub.publish(SyncMapRequest())
+            time.sleep(0.5)
+
+        update = SetMapUpdateRequest()
+        update.enabled = True
+        update.kind = self._explorer_map_kind()
+        self.set_map_update_pub.publish(update)
+        time.sleep(0.2)
+
+        loc_on = SetMapLocalizationRequest()
+        loc_on.enabled = True
+        self.set_map_localization_pub.publish(loc_on)
+        time.sleep(0.2)
+        self.sync_map_pub.publish(SyncMapRequest())
+
+        command = {
+            "received_at": time.time(),
+            "type": "start_mapping",
+            "enabled": True,
+            "cleared": clear,
+            "published_topics": {
+                "set_map_update": self.set_map_update_topic,
+                "clear_map": self.clear_map_topic if clear else None,
+                "set_map_localization": self.set_map_localization_topic if clear else None,
+            },
+        }
+        self.last_mapping_command = command
+        return {"ok": True, "mapping": "started", "cleared": clear, "command": command}
+
+    def stop_mapping(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        _ = payload
+        update = SetMapUpdateRequest()
+        update.enabled = False
+        update.kind = self._explorer_map_kind()
+        self.set_map_update_pub.publish(update)
+        command = {
+            "received_at": time.time(),
+            "type": "stop_mapping",
+            "enabled": False,
+            "published_topics": {"set_map_update": self.set_map_update_topic},
+        }
+        self.last_mapping_command = command
+        return {"ok": True, "mapping": "stopped", "command": command}
+
+    def mapping_status(self) -> Dict[str, Any]:
+        with self.state.lock:
+            basic = dict(self.state.robot_basic_state) if self.state.robot_basic_state else None
+            map_payload = dict(self.state.map) if self.state.map else None
+        map_info = None
+        if map_payload:
+            map_info = {
+                "width": map_payload.get("width"),
+                "height": map_payload.get("height"),
+                "resolution": map_payload.get("resolution"),
+                "origin": map_payload.get("origin"),
+            }
+        return {
+            "ok": True,
+            "is_map_building_enabled": bool(basic.get("is_map_building_enabled")) if basic else None,
+            "is_localization_enabled": bool(basic.get("is_localization_enabled")) if basic else None,
+            "map": map_info,
+            "last_mapping_command": self.last_mapping_command,
+            "last_map_save": self.last_map_save,
+            "last_map_load": self.last_map_load,
+            "maps_dir": str(self.maps_dir),
+            "saved_maps": self.list_saved_maps(),
+        }
+
+    @staticmethod
+    def resolve_map_filename(name: Any) -> Tuple[Optional[str], Optional[str]]:
+        raw = str(name or "").strip()
+        if not raw:
+            return None, "map name is required / 地图名称不能为空"
+        if not raw.lower().endswith(".stcm"):
+            raw = raw + ".stcm"
+        filename = FsPath(raw).name
+        if not filename or filename in (".stcm",) or ".." in filename:
+            return None, "invalid map name / 地图名称无效"
+        if "/" in filename or "\\" in filename:
+            return None, "invalid map name / 地图名称无效"
+        return filename, None
+
+    def resolve_map_save_path(self, name: Any) -> Tuple[Optional[FsPath], Optional[str]]:
+        filename, err = self.resolve_map_filename(name)
+        if err:
+            return None, err
+        base = self.maps_dir.resolve()
+        base.mkdir(parents=True, exist_ok=True)
+        target = (base / filename).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            return None, "invalid map path / 地图保存路径无效"
+        return target, None
+
+    def list_saved_maps(self) -> List[Dict[str, Any]]:
+        base = self.maps_dir
+        if not base.exists():
+            return []
+        items: List[Dict[str, Any]] = []
+        for path in sorted(base.glob("*.stcm")):
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            items.append(
+                {
+                    "name": path.name,
+                    "path": str(path),
+                    "size_bytes": int(stat.st_size),
+                    "modified_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime)),
+                }
+            )
+        return items
+
+    def call_sync_get_stcm(self) -> Tuple[Optional[bytes], Optional[str]]:
+        if not self.sync_get_stcm_client.wait_for_service(timeout_sec=2.0):
+            return None, "sync_get_stcm service unavailable / 思岚地图导出服务不可用"
+        request = SyncGetStcm.Request()
+        future = self.sync_get_stcm_client.call_async(request)
+        deadline = time.time() + self.sync_get_stcm_timeout_sec
+        while not future.done():
+            if time.time() > deadline:
+                return None, "sync_get_stcm timed out / 从底盘导出地图超时"
+            time.sleep(0.05)
+        try:
+            response = future.result()
+        except Exception as exc:
+            return None, f"sync_get_stcm failed / 导出地图失败: {exc}"
+        if response is None:
+            return None, "sync_get_stcm returned no response / 导出地图无响应"
+        raw = bytes(response.raw_stcm)
+        if not raw:
+            return None, "empty map data from chassis / 底盘返回的地图数据为空"
+        return raw, None
+
+    def save_map(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        name = payload.get("name", payload.get("filename", payload.get("map_name")))
+        target, err = self.resolve_map_save_path(name)
+        if err:
+            return {"ok": False, "error": err}
+        raw, err = self.call_sync_get_stcm()
+        if err:
+            return {"ok": False, "error": err}
+        assert target is not None
+        tmp_path = target.with_suffix(target.suffix + ".tmp")
+        try:
+            tmp_path.write_bytes(raw)
+            os.replace(tmp_path, target)
+        except OSError as exc:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+            return {"ok": False, "error": f"failed to write map file / 写入地图文件失败: {exc}"}
+        result = {
+            "ok": True,
+            "name": target.name,
+            "path": str(target),
+            "size_bytes": len(raw),
+            "saved_at": now_iso(),
+            "service": self.sync_get_stcm_service,
+        }
+        self.last_map_save = result
+        return result
+
+    def build_load_robot_pose(self, payload: Optional[Dict[str, Any]] = None) -> Pose:
+        payload = payload or {}
+        pose_payload = payload.get("robot_pose", payload.get("pose"))
+        if isinstance(pose_payload, dict):
+            x = finite_or_none(pose_payload.get("x"), 5) or 0.0
+            y = finite_or_none(pose_payload.get("y"), 5) or 0.0
+            z = finite_or_none(pose_payload.get("z"), 5) or 0.0
+            yaw = finite_or_none(pose_payload.get("yaw"))
+            if yaw is None:
+                yaw_deg = finite_or_none(pose_payload.get("yaw_deg"))
+                yaw = math.radians(float(yaw_deg)) if yaw_deg is not None else 0.0
+        else:
+            with self.state.lock:
+                odom = dict(self.state.odom) if self.state.odom else None
+            if odom and odom.get("x") is not None and odom.get("y") is not None:
+                x = float(odom["x"])
+                y = float(odom["y"])
+                z = float(odom.get("z") or 0.0)
+                yaw = float(odom.get("yaw") or 0.0)
+            else:
+                x = y = z = yaw = 0.0
+        pose_msg = Pose()
+        pose_msg.position.x = float(x)
+        pose_msg.position.y = float(y)
+        pose_msg.position.z = float(z)
+        q = quaternion_from_yaw(float(yaw))
+        pose_msg.orientation.x = q["x"]
+        pose_msg.orientation.y = q["y"]
+        pose_msg.orientation.z = q["z"]
+        pose_msg.orientation.w = q["w"]
+        return pose_msg
+
+    def call_sync_set_stcm(self, raw: bytes, robot_pose: Pose) -> Optional[str]:
+        if not self.sync_set_stcm_client.wait_for_service(timeout_sec=2.0):
+            return "sync_set_stcm service unavailable / 思岚地图加载服务不可用"
+        request = SyncSetStcm.Request()
+        request.raw_stcm = list(raw)
+        request.robot_pose = robot_pose
+        future = self.sync_set_stcm_client.call_async(request)
+        deadline = time.time() + self.sync_set_stcm_timeout_sec
+        while not future.done():
+            if time.time() > deadline:
+                return "sync_set_stcm timed out / 向底盘加载地图超时"
+            time.sleep(0.05)
+        try:
+            future.result()
+        except Exception as exc:
+            return f"sync_set_stcm failed / 加载地图失败: {exc}"
+        return None
+
+    def load_map(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        name = payload.get("name", payload.get("filename", payload.get("map_name")))
+        target, err = self.resolve_map_save_path(name)
+        if err:
+            return {"ok": False, "error": err}
+        assert target is not None
+        if not target.exists():
+            return {"ok": False, "error": f"map file not found / 地图文件不存在: {target.name}"}
+        try:
+            raw = target.read_bytes()
+        except OSError as exc:
+            return {"ok": False, "error": f"failed to read map file / 读取地图文件失败: {exc}"}
+        if not raw:
+            return {"ok": False, "error": "map file is empty / 地图文件为空"}
+        robot_pose = self.build_load_robot_pose(payload)
+        err = self.call_sync_set_stcm(raw, robot_pose)
+        if err:
+            return {"ok": False, "error": err}
+        result = {
+            "ok": True,
+            "name": target.name,
+            "path": str(target),
+            "size_bytes": len(raw),
+            "loaded_at": now_iso(),
+            "service": self.sync_set_stcm_service,
+            "robot_pose": {
+                "x": finite_or_none(robot_pose.position.x, 5),
+                "y": finite_or_none(robot_pose.position.y, 5),
+                "z": finite_or_none(robot_pose.position.z, 5),
+                "yaw": finite_or_none(
+                    yaw_from_quaternion(
+                        robot_pose.orientation.x,
+                        robot_pose.orientation.y,
+                        robot_pose.orientation.z,
+                        robot_pose.orientation.w,
+                    ),
+                    6,
+                ),
+            },
+        }
+        self.last_map_load = result
+        return result
 
     def current_navigation_command(self, max_age_s: float = 300.0) -> Optional[Dict[str, Any]]:
         now = time.time()
@@ -1574,26 +1903,90 @@ class BaseSensorNode(Node):
             "message": "published navigation cancel and arm stop/reset commands",
         }
 
+    def read_lift_height_status(self) -> Dict[str, Any]:
+        url = self.lift_height_url
+        if not url:
+            return {"ok": False, "error": "lift height url is empty"}
+        started = time.time()
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=self.lift_height_timeout_sec) as resp:
+                body = resp.read(65536).decode("utf-8", "replace")
+                status_code = getattr(resp, "status", 200)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "url": url, "error": str(exc), "elapsed_ms": round((time.time() - started) * 1000.0, 1)}
+        try:
+            source_payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            return {"ok": False, "url": url, "http_status": status_code, "error": f"invalid json from lift height service: {exc}", "body_preview": body[:400], "elapsed_ms": round((time.time() - started) * 1000.0, 1)}
+        if not isinstance(source_payload, dict):
+            source_payload = {"value": source_payload}
+        def pick_m(*keys: str) -> Optional[float]:
+            for key in keys:
+                value = finite_or_none(source_payload.get(key))
+                if value is not None:
+                    return float(value)
+            return None
+        physical_height_m = pick_m("physical_height_m", "physicalHeightM", "height_m", "heightM")
+        hispeed_y_m = pick_m("hispeed_y_m", "raw_height_m", "rawHeightM", "sdk_height_m", "sdkHeightM")
+        lift_offset_m = pick_m("lift_offset_m", "offset_m", "offsetM")
+        full_travel_m = pick_m("full_travel_m", "fullTravelM")
+        sdk_min_m = pick_m("sdk_min_m", "sdkMinM")
+        sdk_max_m = pick_m("sdk_max_m", "sdkMaxM")
+        physical_min_m = pick_m("physical_min_m", "physicalMinM")
+        physical_max_m = pick_m("physical_max_m", "physicalMaxM")
+        if physical_height_m is None and hispeed_y_m is not None and lift_offset_m is not None:
+            physical_height_m = hispeed_y_m - lift_offset_m
+        if lift_offset_m is None and hispeed_y_m is not None and physical_height_m is not None:
+            lift_offset_m = hispeed_y_m - physical_height_m
+        if physical_min_m is None:
+            physical_min_m = 0.0
+        if physical_max_m is None and full_travel_m is not None:
+            physical_max_m = full_travel_m
+        if sdk_min_m is None and lift_offset_m is not None and physical_min_m is not None:
+            sdk_min_m = lift_offset_m + physical_min_m
+        if sdk_max_m is None and lift_offset_m is not None and physical_max_m is not None:
+            sdk_max_m = lift_offset_m + physical_max_m
+        def mm(value: Optional[float]) -> Optional[float]:
+            return round(value * 1000.0, 1) if value is not None and math.isfinite(value) else None
+        return {"ok": True, "url": url, "http_status": status_code, "source": source_payload.get("source") or source_payload.get("service") or "lift_height_service", "physical_height_m": finite_or_none(physical_height_m, 6), "physical_height_mm": mm(physical_height_m), "hispeed_y_m": finite_or_none(hispeed_y_m, 6), "hispeed_y_mm": mm(hispeed_y_m), "lift_offset_m": finite_or_none(lift_offset_m, 6), "lift_offset_mm": mm(lift_offset_m), "full_travel_m": finite_or_none(full_travel_m, 6), "full_travel_mm": mm(full_travel_m), "sdk_min_m": finite_or_none(sdk_min_m, 6), "sdk_max_m": finite_or_none(sdk_max_m, 6), "physical_min_m": finite_or_none(physical_min_m, 6), "physical_max_m": finite_or_none(physical_max_m, 6), "data_age_sec": finite_or_none(source_payload.get("data_age_sec"), 3), "timestamp": source_payload.get("timestamp"), "elapsed_ms": round((time.time() - started) * 1000.0, 1), "raw": source_payload}
+
     def execute_column_height_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        target = finite_or_none(
-            payload.get(
-                "target_height_m",
-                payload.get("targetHeightM", payload.get("height_m", payload.get("heightM"))),
-            ),
-            4,
-        )
+        lift_height_before: Optional[Dict[str, Any]] = None
+        target_source = "raw"
+        target_physical = finite_or_none(payload.get("target_physical_height_m", payload.get("targetPhysicalHeightM", payload.get("physical_height_m", payload.get("physicalHeightM")))), 4)
+        if target_physical is not None:
+            target_source = "physical"
+            lift_height_before = self.read_lift_height_status()
+            if not lift_height_before.get("ok"):
+                return {"ok": False, "error": "cannot read current lift offset for physical height control", "target_physical_height_m": target_physical, "lift_height": lift_height_before, "received": payload}
+            physical_min = finite_or_none(lift_height_before.get("physical_min_m")) or 0.0
+            physical_max = finite_or_none(lift_height_before.get("physical_max_m"))
+            full_travel = finite_or_none(lift_height_before.get("full_travel_m"))
+            if physical_max is None:
+                physical_max = full_travel if full_travel is not None else 0.427
+            if target_physical < physical_min - 0.002 or target_physical > physical_max + 0.002:
+                return {"ok": False, "error": f"target_physical_height_m out of range [{physical_min:.3f}, {physical_max:.3f}]", "target_physical_height_m": target_physical, "lift_height": lift_height_before, "received": payload}
+            lift_offset = finite_or_none(lift_height_before.get("lift_offset_m"))
+            if lift_offset is None:
+                hispeed_y = finite_or_none(lift_height_before.get("hispeed_y_m")); physical_now = finite_or_none(lift_height_before.get("physical_height_m"))
+                if hispeed_y is not None and physical_now is not None:
+                    lift_offset = hispeed_y - physical_now
+            if lift_offset is None:
+                return {"ok": False, "error": "lift_offset_m unavailable; cannot convert physical height to raw SDK target", "target_physical_height_m": target_physical, "lift_height": lift_height_before, "received": payload}
+            target = finite_or_none(target_physical + lift_offset, 4)
+        else:
+            target = finite_or_none(payload.get("target_height_m", payload.get("targetHeightM", payload.get("height_m", payload.get("heightM")))), 4)
+            if target is None:
+                return {"ok": False, "error": "target_physical_height_m or target_height_m is required", "received": payload}
         if target is None:
-            return {"ok": False, "error": "target_height_m is required", "received": payload}
-        if target < self.column_height_min_m or target > self.column_height_max_m:
-            return {
-                "ok": False,
-                "error": (
-                    f"target_height_m out of range "
-                    f"[{self.column_height_min_m:.3f}, {self.column_height_max_m:.3f}]"
-                ),
-                "target_height_m": target,
-                "received": payload,
-            }
+            return {"ok": False, "error": "converted raw target_height_m is invalid", "received": payload}
+        if target_source == "raw" and (target < self.column_height_min_m or target > self.column_height_max_m):
+            return {"ok": False, "error": (f"target_height_m out of range " f"[{self.column_height_min_m:.3f}, {self.column_height_max_m:.3f}]"), "target_height_m": target, "received": payload}
+        if target_source == "physical" and lift_height_before:
+            sdk_min = finite_or_none(lift_height_before.get("sdk_min_m")); sdk_max = finite_or_none(lift_height_before.get("sdk_max_m"))
+            if sdk_min is not None and sdk_max is not None and (target < sdk_min - 0.02 or target > sdk_max + 0.02):
+                return {"ok": False, "error": f"converted raw target_height_m out of SDK range [{sdk_min:.3f}, {sdk_max:.3f}]", "target_height_m": target, "target_physical_height_m": target_physical, "lift_height": lift_height_before, "received": payload}
         timeout = finite_or_none(payload.get("timeout_sec", payload.get("timeoutSec", self.column_height_timeout_sec)), 2)
         if timeout is None:
             timeout = self.column_height_timeout_sec
@@ -1619,8 +2012,12 @@ class BaseSensorNode(Node):
             "argv": argv,
             "cwd": workdir,
             "target_height_m": target,
+            "target_raw_height_m": target,
+            "target_physical_height_m": target_physical,
+            "target_source": target_source,
             "timeout_sec": timeout,
             "dry_run": dry_run,
+            "lift_height_before": lift_height_before,
         }
         if dry_run:
             return {
@@ -1663,6 +2060,7 @@ class BaseSensorNode(Node):
                 "finished_at": now_iso(),
             }
         ok = result.returncode == 0
+        lift_height_after = self.read_lift_height_status() if not dry_run else None
         return {
             "ok": ok,
             "error": None if ok else f"column height command failed with returncode {result.returncode}",
@@ -1673,6 +2071,8 @@ class BaseSensorNode(Node):
             "stderr": result.stderr,
             "started_at": started_at,
             "finished_at": now_iso(),
+            "lift_height_before": lift_height_before,
+            "lift_height_after": lift_height_after,
         }
 
     def start_navigation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2339,6 +2739,9 @@ HTML = r"""<!doctype html>
       background: var(--bg);
       color: var(--text);
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
     }
     header {
       display: flex;
@@ -2362,6 +2765,43 @@ HTML = r"""<!doctype html>
     }
     .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--warn); }
     .dot.ok { background: var(--ok); }
+    .map-build-status { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .header-tabs { display: flex; align-items: baseline; gap: 16px; min-width: 0; }
+    .view-tab {
+      padding: 0;
+      border: none;
+      background: none;
+      font-family: inherit;
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 15px;
+      font-weight: 600;
+      line-height: 1.2;
+      transition: font-size .12s ease, color .12s ease;
+    }
+    .view-tab:not(.active):hover { color: var(--text); text-decoration: underline; }
+    .view-tab.active { background: none; border: none; color: var(--text); font-size: 20px; font-weight: 700; cursor: default; }
+    main.view-hidden { display: none; }
+    #mappingView { display: none; flex: 1; min-height: 0; flex-direction: column; padding: 14px; }
+    #mappingView.view-active { display: flex; }
+    .mapping-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-bottom: 12px; }
+    .mapping-toolbar button {
+      padding: 7px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      cursor: pointer;
+    }
+    .mapping-toolbar button.primary { background: var(--text); color: #fff; border-color: var(--text); font-weight: 600; }
+    .mapping-toolbar button.primary:hover { filter: brightness(1.25); }
+    .mapping-toolbar button:not(.primary):hover { background: #eef1f6; }
+    .mapping-toolbar button:disabled { opacity: .5; cursor: not-allowed; }
+    body.mapping-active { height: 100vh; overflow: hidden; }
+    .mapping-canvas-host { flex: 1; min-height: 0; display: flex; }
+    .mapping-canvas-host .canvas-wrap { flex: 1; width: 100%; height: 100%; min-height: 0; margin: 0; padding: 0; }
+    .mapping-canvas-host .canvas-wrap canvas,
+    .mapping-canvas-host #mapCanvas { width: 100%; height: 100%; aspect-ratio: auto; }
     main {
       display: grid;
       grid-template-columns: minmax(360px, 1.2fr) minmax(340px, 1fr);
@@ -2442,6 +2882,9 @@ HTML = r"""<!doctype html>
       background: #fff;
       color: var(--text);
     }
+    .column-height-status { grid-column: 1 / -1; border: 1px solid #bfdbfe; border-radius: 8px; background: #eff6ff; color: #1e3a8a; padding: 8px 10px; font-size: 12px; line-height: 1.45; }
+    .column-height-buttons { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+    .column-height-buttons button { min-height: 34px; }
     .action-builder-actions {
       display: flex;
       flex-wrap: wrap;
@@ -2962,9 +3405,23 @@ HTML = r"""<!doctype html>
 </head>
 <body>
   <header>
-    <h1>Base Sensor Dashboard</h1>
+    <div class="header-tabs">
+      <button id="tabDashboard" class="view-tab active">Base Sensor Dashboard</button>
+      <button id="tabMapping" class="view-tab">Mapping Mode</button>
+    </div>
     <div class="status"><span id="statusDot" class="dot"></span><span id="statusText">connecting</span></div>
   </header>
+
+  <div id="mappingView">
+    <div class="mapping-toolbar">
+      <button id="startMappingBtn" class="primary" title="Clear the chassis map and start a fresh mapping session">Start Mapping</button>
+      <button id="stopMappingBtn" title="Freeze the map and stop the mapping session">Stop Mapping</button>
+      <button id="saveMappingBtn" title="Export the current chassis map to a .stcm file">Save Map</button>
+      <button id="loadMappingBtn" title="Load a saved .stcm map file into the chassis">Load Map</button>
+      <span id="mappingStatus" class="map-build-status">Mapping: --</span>
+    </div>
+    <div id="mappingCanvasHost" class="mapping-canvas-host"></div>
+  </div>
   <main>
     <section class="map-section">
       <div class="panel-head">
@@ -3071,13 +3528,18 @@ HTML = r"""<!doctype html>
               <label class="arm-action-field">超时 s
                 <input id="newArmTimeoutSec" type="number" step="1" min="1" max="600" value="120" />
               </label>
-              <label class="column-action-field">目标 raw 高度 m
-                <input id="newColumnTargetHeightM" type="number" step="0.001" min="-0.053" max="0.376" value="0" />
+              <label class="column-action-field">目标物理高度 m
+                <input id="newColumnTargetHeightM" type="number" step="0.001" min="0" max="0.427" value="0" />
               </label>
-              <label class="column-action-field">超时 s
+              <label class="column-action-field">?? s
                 <input id="newColumnTimeoutSec" type="number" step="1" min="1" max="180" value="30" />
               </label>
-              <div class="column-action-field workflow-detail">可填闭环目标：-0.053 ~ 0.376 m；当前遥控器最高实测 raw=0.3759m。</div>
+              <div class="column-action-field column-height-status" id="columnHeightStatus">当前立柱高度：--</div>
+              <div class="column-action-field column-height-buttons">
+                <button id="refreshColumnHeightBtn" type="button">刷新立柱高度</button>
+                <button id="fillCurrentColumnHeightBtn" type="button">填当前高度</button>
+              </div>
+              <div class="column-action-field workflow-detail">这里填写真实物理高度 0.000 ~ 0.427 m；执行时后端会按当前 offset 自动换算为 raw SDK 目标。</div>
             </div>
             <div class="action-builder-actions">
               <button id="fillCurrentPoseBtn">填当前位置</button>
@@ -3209,6 +3671,7 @@ HTML = r"""<!doctype html>
     let editingPointId = null;
     let workflowActions = [];
     let editingActionId = null;
+    let lastLiftHeight = null;
     let draggedActionId = null;
     let workflowRun = {
       running: false,
@@ -3621,8 +4084,10 @@ HTML = r"""<!doctype html>
         document.getElementById('newArmTargetObject').value = target;
         document.getElementById('newArmTimeoutSec').value = Number(resolved.timeoutSec || 120).toFixed(0);
       } else if (type === 'column_height') {
-        document.getElementById('newColumnTargetHeightM').value = Number(resolved.targetHeightM || 0).toFixed(3);
+        const physicalTarget = resolved.targetPhysicalHeightM ?? resolved.target_physical_height_m ?? resolved.targetHeightM ?? 0;
+        document.getElementById('newColumnTargetHeightM').value = Number(physicalTarget || 0).toFixed(3);
         document.getElementById('newColumnTimeoutSec').value = Number(resolved.timeoutSec || 30).toFixed(0);
+        refreshColumnHeightStatus({ quiet: true });
       }
       const btn = document.getElementById('addWorkflowActionBtn');
       if (btn) btn.textContent = '\u4fdd\u5b58\u52a8\u4f5c';
@@ -4176,6 +4641,172 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function updateMappingStatus(state) {
+      const el = document.getElementById('mappingStatus');
+      if (!el) return;
+      const basic = state && state.navigation ? state.navigation.robot_basic_state : null;
+      const building = basic ? basic.is_map_building_enabled : null;
+      if (building === null || building === undefined) {
+        el.textContent = 'Mapping: --';
+        el.style.color = 'var(--muted)';
+        return;
+      }
+      el.textContent = building ? 'Mapping: ON' : 'Mapping: OFF';
+      el.style.color = building ? 'var(--ok)' : 'var(--muted)';
+    }
+
+    let mappingModeActive = false;
+    let mapWrapPlaceholder = null;
+
+    function enterMappingMode() {
+      if (mappingModeActive) return;
+      const wrap = mapCanvas.parentElement;
+      const host = document.getElementById('mappingCanvasHost');
+      const view = document.getElementById('mappingView');
+      const mainEl = document.querySelector('main');
+      if (!wrap || !host || !view || !mainEl) return;
+      if (!mapWrapPlaceholder) mapWrapPlaceholder = document.createComment('map-wrap-home');
+      if (wrap.parentNode) wrap.parentNode.insertBefore(mapWrapPlaceholder, wrap);
+      host.appendChild(wrap);
+      document.body.classList.add('mapping-active');
+      mainEl.classList.add('view-hidden');
+      view.classList.add('view-active');
+      document.getElementById('tabMapping').classList.add('active');
+      document.getElementById('tabDashboard').classList.remove('active');
+      mappingModeActive = true;
+      cachedMapSeq = -1;
+      try { if (lastState) drawMap(lastState); } catch (e) {}
+    }
+
+    function exitMappingMode() {
+      const view = document.getElementById('mappingView');
+      const mainEl = document.querySelector('main');
+      if (view) view.classList.remove('view-active');
+      if (mainEl) mainEl.classList.remove('view-hidden');
+      document.body.classList.remove('mapping-active');
+      const wrap = mapCanvas.parentElement;
+      if (wrap && mapWrapPlaceholder && mapWrapPlaceholder.parentNode) {
+        mapWrapPlaceholder.parentNode.insertBefore(wrap, mapWrapPlaceholder);
+        mapWrapPlaceholder.parentNode.removeChild(mapWrapPlaceholder);
+      }
+      document.getElementById('tabDashboard').classList.add('active');
+      document.getElementById('tabMapping').classList.remove('active');
+      mappingModeActive = false;
+      cachedMapSeq = -1;
+      try { if (lastState) drawMap(lastState); } catch (e) {}
+    }
+
+    async function startMapping() {
+      if (!confirm('开始重新建图？此操作会清空底盘上当前的地图。\n（备注：开始采集只清空底盘当前地图，已存档的地图文件不会被清空。）\nStart a fresh map? This will CLEAR the current map on the chassis.\n(Note: starting a new session only clears the chassis map; archived map files are kept.)')) return;
+      const btn = document.getElementById('startMappingBtn');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/mapping/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ clear: true }),
+        });
+        const data = await res.json();
+        if (!data.ok) alert('开始采集失败 / Start mapping failed: ' + (data.error || 'unknown'));
+      } catch (err) {
+        alert('开始采集出错 / Start mapping error: ' + err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function stopMapping() {
+      const btn = document.getElementById('stopMappingBtn');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/mapping/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        if (!data.ok) alert('结束采集失败 / Stop mapping failed: ' + (data.error || 'unknown'));
+      } catch (err) {
+        alert('结束采集出错 / Stop mapping error: ' + err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function saveMap() {
+      const name = prompt(
+        '输入地图名称（例如 八维通 或 八维通.stcm）\nEnter map name (e.g. Baweitong or Baweitong.stcm):',
+        ''
+      );
+      if (!name || !String(name).trim()) return;
+      const btn = document.getElementById('saveMappingBtn');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/mapping/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: String(name).trim() }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert('保存地图失败 / Save map failed: ' + (data.error || 'unknown'));
+          return;
+        }
+        alert(
+          `地图已保存 / Map saved:\n${data.path}\n${data.size_bytes} bytes`
+        );
+      } catch (err) {
+        alert('保存地图出错 / Save map error: ' + err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function loadMap() {
+      let hint = '输入要加载的地图名称 / Enter map name to load:';
+      let defaultName = '';
+      try {
+        const listRes = await fetch('/api/mapping/list', { cache: 'no-store' });
+        const listData = await listRes.json();
+        const maps = listData.saved_maps || [];
+        if (maps.length) {
+          defaultName = maps[maps.length - 1].name.replace(/\.stcm$/i, '');
+          hint = '已存档地图 / Saved maps:\n' +
+            maps.map(m => `- ${m.name} (${m.size_bytes} bytes)`).join('\n') +
+            '\n\n输入要加载的名称 / Enter map name to load:';
+        }
+      } catch (err) {
+        hint = '读取地图列表失败，仍可手动输入名称 / Failed to list maps, enter name manually:';
+      }
+      const name = prompt(hint, defaultName);
+      if (!name || !String(name).trim()) return;
+      if (!confirm(
+        '将把已存档地图加载到底盘，覆盖底盘当前地图。\n' +
+        'Load the archived map into the chassis and replace the current chassis map?'
+      )) return;
+      const btn = document.getElementById('loadMappingBtn');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/mapping/load', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: String(name).trim() }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert('加载地图失败 / Load map failed: ' + (data.error || 'unknown'));
+          return;
+        }
+        alert(`地图已加载 / Map loaded:\n${data.path}\n${data.size_bytes} bytes`);
+        cachedMapSeq = -1;
+        if (lastState) drawMap(lastState);
+      } catch (err) {
+        alert('加载地图出错 / Load map error: ' + err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
     async function tick() {
       try {
         const res = await fetch('/api/state', { cache: 'no-store' });
@@ -4190,6 +4821,7 @@ HTML = r"""<!doctype html>
         updateReadouts(state);
         updateNavigationStatus(state);
         updateWorkflowProgress(state);
+        updateMappingStatus(state);
         document.getElementById('rawState').textContent = JSON.stringify({
           freshness_s: state.freshness_s,
           seq: state.seq,
@@ -4247,6 +4879,50 @@ HTML = r"""<!doctype html>
       catch (err) { data = { ok: false, error: text || String(err) }; }
       if (!res.ok) data.ok = false;
       return data;
+    }
+
+    function updateColumnHeightStatus(data) {
+      const el = document.getElementById('columnHeightStatus');
+      if (!el) return;
+      if (!data || data.ok === false) {
+        el.textContent = `当前立柱高度：读取失败 ${data?.error || ''}`;
+        return;
+      }
+      lastLiftHeight = data;
+      const physical = Number.isFinite(Number(data.physical_height_m)) ? Number(data.physical_height_m).toFixed(3) : '--';
+      const raw = Number.isFinite(Number(data.hispeed_y_m)) ? Number(data.hispeed_y_m).toFixed(3) : '--';
+      const offset = Number.isFinite(Number(data.lift_offset_m)) ? Number(data.lift_offset_m).toFixed(3) : '--';
+      const max = Number.isFinite(Number(data.physical_max_m)) ? Number(data.physical_max_m).toFixed(3) : (Number.isFinite(Number(data.full_travel_m)) ? Number(data.full_travel_m).toFixed(3) : '--');
+      const age = Number.isFinite(Number(data.data_age_sec)) ? `${Number(data.data_age_sec).toFixed(1)}s` : '--';
+      el.textContent = `当前立柱物理高度 ${physical} m（raw=${raw} m，offset=${offset} m，范围 0~${max} m，age=${age}）`;
+      const input = document.getElementById('newColumnTargetHeightM');
+      if (input && Number.isFinite(Number(data.physical_max_m))) input.max = Number(data.physical_max_m).toFixed(3);
+    }
+
+    async function refreshColumnHeightStatus({ quiet = false } = {}) {
+      try {
+        const res = await fetch('/api/lift_height', { cache: 'no-store' });
+        const data = await res.json();
+        updateColumnHeightStatus(data);
+        if (!quiet) showNavMessage(data.ok ? '' : 'bad', data.ok ? `立柱：当前物理高度 <strong>${Number(data.physical_height_m || 0).toFixed(3)}m</strong>` : `立柱：<strong>高度读取失败</strong> ${data.error || ''}`);
+        return data;
+      } catch (err) {
+        const data = { ok: false, error: String(err) };
+        updateColumnHeightStatus(data);
+        if (!quiet) showNavMessage('bad', `立柱：<strong>高度读取失败</strong> ${err}`);
+        return data;
+      }
+    }
+
+    async function fillCurrentColumnHeight() {
+      const data = lastLiftHeight?.ok ? lastLiftHeight : await refreshColumnHeightStatus({ quiet: true });
+      if (!data?.ok || !Number.isFinite(Number(data.physical_height_m))) {
+        showNavMessage('bad', `立柱：<strong>没有可用的当前物理高度</strong> ${data?.error || ''}`);
+        return;
+      }
+      const input = document.getElementById('newColumnTargetHeightM');
+      if (input) input.value = Number(data.physical_height_m).toFixed(3);
+      showNavMessage('', `立柱：已填当前物理高度 <strong>${Number(data.physical_height_m).toFixed(3)}m</strong>`);
     }
 
     async function saveRelocalizationAnchor() {
@@ -4369,6 +5045,8 @@ HTML = r"""<!doctype html>
           return {
             ...action,
             title: action.title || '立柱升降',
+            targetPhysicalHeightM: action.targetPhysicalHeightM ?? action.target_physical_height_m,
+            targetHeightM: action.targetHeightM ?? action.target_height_m,
             timeoutSec: action.timeoutSec || 30,
             index
           };
@@ -4622,7 +5300,11 @@ HTML = r"""<!doctype html>
         return `ROS 手臂任务：phase=${phase}${targetText}，超时 ${action.timeoutSec || 120}s`;
       }
       if (action.type === 'column_height') {
-        return `G1D 立柱 raw 高度：target=${Number(action.targetHeightM || 0).toFixed(3)}m，可填 -0.053~0.376m，超时 ${action.timeoutSec || 30}s`;
+        const physical = action.targetPhysicalHeightM ?? action.target_physical_height_m;
+        if (physical !== undefined && physical !== null) {
+          return `G1D 立柱物理高度：target=${Number(physical || 0).toFixed(3)}m，后端自动换算 raw，超时 ${action.timeoutSec || 30}s`;
+        }
+        return `G1D 立柱 raw 高度：target=${Number(action.targetHeightM || 0).toFixed(3)}m（旧动作），超时 ${action.timeoutSec || 30}s`;
       }
       return '预留动作模块';
     }
@@ -5106,6 +5788,7 @@ HTML = r"""<!doctype html>
       });
       document.getElementById('newArmTargetObject').disabled = !isArmPick;
       document.getElementById('fillCurrentPoseBtn').style.display = isNav ? '' : 'none';
+      if (isColumn) refreshColumnHeightStatus({ quiet: true });
     }
 
     function addActionFromBuilder() {
@@ -5170,14 +5853,15 @@ HTML = r"""<!doctype html>
         return;
       }
       if (type === 'column_height') {
-        const targetHeightM = Number(document.getElementById('newColumnTargetHeightM').value);
+        const targetPhysicalHeightM = Number(document.getElementById('newColumnTargetHeightM').value);
         const timeoutSec = Number(document.getElementById('newColumnTimeoutSec').value || 30);
-        if (!Number.isFinite(targetHeightM)) {
-          showNavMessage('bad', '动作链：<strong>立柱升降需要有效 raw 目标高度</strong>');
+        const maxPhysical = Number(lastLiftHeight?.physical_max_m ?? lastLiftHeight?.full_travel_m ?? 0.427);
+        if (!Number.isFinite(targetPhysicalHeightM)) {
+          showNavMessage('bad', '动作链：<strong>立柱升降需要有效物理目标高度</strong>');
           return;
         }
-        if (targetHeightM < -0.053 || targetHeightM > 0.376) {
-          showNavMessage('bad', '动作链：<strong>立柱 raw 闭环目标范围是 -0.053 ~ 0.376 m</strong>');
+        if (targetPhysicalHeightM < -0.002 || targetPhysicalHeightM > maxPhysical + 0.002) {
+          showNavMessage('bad', `动作链：<strong>立柱物理高度范围是 0.000 ~ ${maxPhysical.toFixed(3)} m</strong>`);
           return;
         }
         if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) {
@@ -5188,11 +5872,11 @@ HTML = r"""<!doctype html>
           id: makeActionId('column'),
           type: 'column_height',
           title: '立柱升降',
-          targetHeightM: Number(targetHeightM.toFixed(4)),
+          targetPhysicalHeightM: Number(targetPhysicalHeightM.toFixed(4)),
           timeoutSec: Math.max(1, Math.min(180, Number(timeoutSec.toFixed(1))))
         };
         const commitMode = commitWorkflowAction(action);
-        showNavMessage('', `动作链：已${commitMode === 'edited' ? '保存' : '增加'}“立柱升降” raw target=${action.targetHeightM.toFixed(3)}m`);
+        showNavMessage('', `动作链：已${commitMode === 'edited' ? '保存' : '增加'}“立柱升降” 物理高度=${action.targetPhysicalHeightM.toFixed(3)}m`);
         return;
       }
       const commitMode = commitWorkflowAction({
@@ -5387,13 +6071,23 @@ HTML = r"""<!doctype html>
             workflowRun.actionStartedAt = Date.now();
             workflowRun.actionDurationSec = action.timeoutSec || 30;
             renderWorkflow();
-            showNavMessage('', `动作链：正在执行第 ${index + 1} 步“立柱升降” raw target=${Number(action.targetHeightM || 0).toFixed(3)}m...`);
-            const actionData = await postJson('/api/actions/execute', {
+            const physicalTarget = action.targetPhysicalHeightM ?? action.target_physical_height_m;
+            const rawTarget = action.targetHeightM ?? action.target_height_m;
+            const targetText = physicalTarget !== undefined && physicalTarget !== null
+              ? `物理高度=${Number(physicalTarget || 0).toFixed(3)}m`
+              : `raw target=${Number(rawTarget || 0).toFixed(3)}m`;
+            showNavMessage('', `动作链：正在执行第 ${index + 1} 步“立柱升降” ${targetText}...`);
+            const payload = {
               type: 'column_height',
-              target_height_m: Number(action.targetHeightM || 0),
               timeout_sec: workflowRun.actionDurationSec,
               name: action.title || '立柱升降'
-            });
+            };
+            if (physicalTarget !== undefined && physicalTarget !== null) {
+              payload.target_physical_height_m = Number(physicalTarget || 0);
+            } else {
+              payload.target_height_m = Number(rawTarget || 0);
+            }
+            const actionData = await postJson('/api/actions/execute', payload);
             if (!actionData.ok) {
               throw new Error(actionData.error || '立柱升降执行失败');
             }
@@ -5553,6 +6247,13 @@ HTML = r"""<!doctype html>
     });
     document.getElementById('saveRelocalizationAnchorBtn').addEventListener('click', saveRelocalizationAnchor);
     document.getElementById('runRelocalizationBtn').addEventListener('click', runRelocalization);
+    document.getElementById('startMappingBtn').addEventListener('click', startMapping);
+    document.getElementById('stopMappingBtn').addEventListener('click', stopMapping);
+    document.getElementById('saveMappingBtn').addEventListener('click', saveMap);
+    document.getElementById('loadMappingBtn').addEventListener('click', loadMap);
+    document.getElementById('tabMapping').addEventListener('click', enterMappingMode);
+    document.getElementById('tabDashboard').addEventListener('click', exitMappingMode);
+    document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && mappingModeActive) exitMappingMode(); });
     document.getElementById('startNavigationBtn').addEventListener('click', startNavigation);
     document.getElementById('runWorkflowBtn').addEventListener('click', runWorkflow);
     document.getElementById('stopNavigationBtn').addEventListener('click', stopNavigation);
@@ -5588,6 +6289,8 @@ HTML = r"""<!doctype html>
     });
     cloudCanvas.addEventListener('pointerup', () => { cloudDragging = false; });
     cloudCanvas.addEventListener('pointerleave', () => { cloudDragging = false; });
+    document.getElementById('refreshColumnHeightBtn')?.addEventListener('click', () => refreshColumnHeightStatus());
+    document.getElementById('fillCurrentColumnHeightBtn')?.addEventListener('click', () => fillCurrentColumnHeight());
 
     window.addEventListener('resize', () => { cachedMapSeq = -1; tick(); });
     setInterval(tick, 500);
@@ -5597,6 +6300,7 @@ HTML = r"""<!doctype html>
     renderWorkflow();
     loadSavedPoints();
     loadRelocalizationStatus();
+    refreshColumnHeightStatus({ quiet: true });
     tick();
   </script>
 </body>
@@ -5620,10 +6324,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.write_json(self.state.snapshot())
         elif parsed.path == "/api/points":
             self.write_json(self.point_store.list_payload())
+        elif parsed.path in ("/api/lift_height", "/api/column_height/current"):
+            self.write_json(self.node_ref.read_lift_height_status())
         elif parsed.path == "/api/fault_snapshots":
             self.write_json(self.node_ref.fault_logger.list_payload())
         elif parsed.path in ("/api/relocalization/status", "/api/relocalization"):
             self.write_json(self.node_ref.relocalization_status())
+        elif parsed.path == "/api/mapping/status":
+            self.write_json(self.node_ref.mapping_status())
+        elif parsed.path in ("/api/mapping/list", "/api/mapping/files"):
+            self.write_json({"ok": True, "maps_dir": str(self.node_ref.maps_dir), "saved_maps": self.node_ref.list_saved_maps()})
         elif parsed.path == "/api/health":
             snap = self.state.snapshot()
             self.write_json(
@@ -5685,6 +6395,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             self.write_json(self.node_ref.run_relocalization(payload))
+        elif parsed.path in ("/api/mapping/start", "/api/mapping/start_collection"):
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.start_mapping(payload))
+        elif parsed.path in ("/api/mapping/stop", "/api/mapping/stop_collection"):
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.stop_mapping(payload))
+        elif parsed.path in ("/api/mapping/save", "/api/mapping/save_map"):
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.save_map(payload))
+        elif parsed.path in ("/api/mapping/load", "/api/mapping/load_map"):
+            payload = self.read_json_body()
+            if payload is None:
+                return
+            self.write_json(self.node_ref.load_map(payload))
+        elif parsed.path in ("/api/mapping/list", "/api/mapping/files"):
+            self.write_json({"ok": True, "maps_dir": str(self.node_ref.maps_dir), "saved_maps": self.node_ref.list_saved_maps()})
         elif parsed.path == "/api/fault_snapshots/log":
             payload = self.read_json_body()
             if payload is None:
@@ -5785,6 +6517,13 @@ def main() -> int:
     parser.add_argument("--set-pose-topic", default="/slamware_ros_sdk_server_node/set_pose")
     parser.add_argument("--recover-localization-topic", default="/slamware_ros_sdk_server_node/recover_localization")
     parser.add_argument("--set-map-localization-topic", default="/slamware_ros_sdk_server_node/set_map_localization")
+    parser.add_argument("--set-map-update-topic", default="/slamware_ros_sdk_server_node/set_map_update")
+    parser.add_argument("--clear-map-topic", default="/slamware_ros_sdk_server_node/clear_map")
+    parser.add_argument("--sync-get-stcm-service", default="/sync_get_stcm")
+    parser.add_argument("--sync-set-stcm-service", default="/sync_set_stcm")
+    parser.add_argument("--maps-dir", default="data/map")
+    parser.add_argument("--sync-get-stcm-timeout-sec", type=float, default=30.0)
+    parser.add_argument("--sync-set-stcm-timeout-sec", type=float, default=30.0)
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--global-plan-path-topic", default="/slamware_ros_sdk_server_node/global_plan_path")
     parser.add_argument("--robot-basic-state-topic", default="/slamware_ros_sdk_server_node/robot_basic_state")
@@ -5804,6 +6543,8 @@ def main() -> int:
     parser.add_argument("--column-height-timeout-sec", type=float, default=30.0)
     parser.add_argument("--column-height-min-m", type=float, default=-0.053)
     parser.add_argument("--column-height-max-m", type=float, default=0.376)
+    parser.add_argument("--lift-height-url", default="http://127.0.0.1:28089/api/basic_status")
+    parser.add_argument("--lift-height-timeout-sec", type=float, default=1.0)
     parser.add_argument("--raw-nav-linear-speed-mps", type=float, default=0.12)
     parser.add_argument("--raw-nav-angular-speed-radps", type=float, default=0.45)
     parser.add_argument("--raw-nav-position-tolerance-m", type=float, default=0.08)
@@ -5840,6 +6581,13 @@ def main() -> int:
         set_pose_topic=args.set_pose_topic,
         recover_localization_topic=args.recover_localization_topic,
         set_map_localization_topic=args.set_map_localization_topic,
+        set_map_update_topic=args.set_map_update_topic,
+        clear_map_topic=args.clear_map_topic,
+        sync_get_stcm_service=args.sync_get_stcm_service,
+        sync_set_stcm_service=args.sync_set_stcm_service,
+        maps_dir=args.maps_dir,
+        sync_get_stcm_timeout_sec=args.sync_get_stcm_timeout_sec,
+        sync_set_stcm_timeout_sec=args.sync_set_stcm_timeout_sec,
         cmd_vel_topic=args.cmd_vel_topic,
         global_plan_path_topic=args.global_plan_path_topic,
         robot_basic_state_topic=args.robot_basic_state_topic,
@@ -5855,6 +6603,8 @@ def main() -> int:
         column_height_timeout_sec=args.column_height_timeout_sec,
         column_height_min_m=args.column_height_min_m,
         column_height_max_m=args.column_height_max_m,
+        lift_height_url=args.lift_height_url,
+        lift_height_timeout_sec=args.lift_height_timeout_sec,
         raw_nav_linear_speed_mps=args.raw_nav_linear_speed_mps,
         raw_nav_angular_speed_radps=args.raw_nav_angular_speed_radps,
         raw_nav_position_tolerance_m=args.raw_nav_position_tolerance_m,
