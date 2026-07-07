@@ -343,11 +343,28 @@ class BaseSensorNode(Node):
     # 2D 重定位(LaserScan ↔ 占据栅格,自研):定时保存位姿 + 三种匹配 + 可选喂底盘
     # ------------------------------------------------------------------
     def save_last_pose(self) -> Optional[Dict[str, Any]]:
-        """把当前 odom 位姿覆盖写入 last_pose.json(供 json-初值 重定位读取)。"""
+        """把当前 odom 位姿覆盖写入 last_pose.json(供 json-初值 重定位读取)。
+
+        只有在定位真正有效时才保存,否则跳过并保留上一次的好位姿。否则开机后
+        (尚未重定位、定位未建立)会把未知/默认位姿写进 json,污染「上次位姿」初值。
+        有效性要求:robot_basic_state 新鲜 + is_localization_enabled + quality>0。
+        """
+        now = time.time()
         with self.state.lock:
             odom = dict(self.state.odom) if self.state.odom else None
+            basic = dict(self.state.robot_basic_state) if self.state.robot_basic_state else None
         if not odom or odom.get("x") is None or odom.get("y") is None:
             return None
+        # 定位有效性门槛:未建立定位时不保存,避免污染 json 初值。
+        if not basic:
+            return None
+        if now - float(basic.get("received_at", 0.0)) > 3.0:
+            return None  # 状态过期,不确定定位是否有效
+        if not basic.get("is_localization_enabled"):
+            return None
+        quality = basic.get("localization_quality")
+        if quality is None or int(quality) <= 0:
+            return None  # 质量<=0 视为未知/丢失
         record = {
             "x": finite_or_none(odom.get("x"), 5),
             "y": finite_or_none(odom.get("y"), 5),

@@ -46,6 +46,53 @@ function drawMapPolyline(ctx, map, geom, points, color, width, dashed = false) {
   ctx.restore()
 }
 
+// 重定位候选位姿预览:在应用前把匹配算出的位姿画成醒目箭头(达标绿/未达标橙),
+// 让用户先看清落点与朝向,再决定是否「应用到底盘」。
+function drawPreviewPose(ctx, map, geom, pose) {
+  if (pose.x === null || pose.x === undefined) return
+  const dpr = window.devicePixelRatio || 1
+  const c = mapToCanvas(map, pose.x, pose.y, geom)
+  const yaw = pose.yaw || 0
+  const color = pose.accepted ? '#16a34a' : '#f97316'
+  const size = 16 * dpr
+  ctx.save()
+  // 半透明光环,突出候选点位置。
+  ctx.beginPath()
+  ctx.arc(c.x, c.y, size * 1.4, 0, Math.PI * 2)
+  ctx.fillStyle = pose.accepted ? 'rgba(22,163,74,0.18)' : 'rgba(249,115,22,0.18)'
+  ctx.fill()
+  ctx.lineWidth = 2 * dpr
+  ctx.strokeStyle = color
+  ctx.setLineDash([5 * dpr, 4 * dpr])
+  ctx.stroke()
+  ctx.setLineDash([])
+  // 朝向箭头(带白色描边,任意底图上都清晰)。
+  ctx.translate(c.x, c.y)
+  ctx.rotate(-yaw)
+  ctx.beginPath()
+  ctx.moveTo(size, 0)
+  ctx.lineTo(-size * 0.7, size * 0.6)
+  ctx.lineTo(-size * 0.4, 0)
+  ctx.lineTo(-size * 0.7, -size * 0.6)
+  ctx.closePath()
+  ctx.fillStyle = color
+  ctx.strokeStyle = '#ffffff'
+  ctx.lineWidth = 2 * dpr
+  ctx.fill()
+  ctx.stroke()
+  ctx.rotate(yaw)
+  // 标签。
+  const label = pose.accepted ? '候选位姿(达标)' : '候选位姿(谨慎)'
+  ctx.font = `${12 * dpr}px system-ui, sans-serif`
+  ctx.textAlign = 'center'
+  ctx.lineWidth = 4 * dpr
+  ctx.strokeStyle = '#ffffff'
+  ctx.strokeText(label, 0, -size * 1.7)
+  ctx.fillStyle = color
+  ctx.fillText(label, 0, -size * 1.7)
+  ctx.restore()
+}
+
 function drawArrow(ctx, start, end, color, label) {
   const dpr = window.devicePixelRatio || 1
   const angle = Math.atan2(end.y - start.y, end.x - start.x)
@@ -219,10 +266,16 @@ export function drawMap(canvas, state, nav, metaRef) {
     ctx.strokeStyle = '#2563eb'
     ctx.lineWidth = Math.max(2, 2 * (window.devicePixelRatio || 1))
     ctx.beginPath()
-    state.track.forEach((p, i) => {
+    // 相邻里程计点间距超过该阈值(米)视为位姿跳变(如重定位 set_pose),
+    // 断开子路径以免把跳变前后连成一条长线。正常行驶相邻点仅几厘米。
+    const JUMP_BREAK_M = 0.5
+    let prev = null
+    state.track.forEach(p => {
       const c = mapToCanvas(map, p.x, p.y, geom)
-      if (i === 0) ctx.moveTo(c.x, c.y)
+      const jumped = prev && Math.hypot(p.x - prev.x, p.y - prev.y) > JUMP_BREAK_M
+      if (!prev || jumped) ctx.moveTo(c.x, c.y)
       else ctx.lineTo(c.x, c.y)
+      prev = p
     })
     ctx.stroke()
   }
@@ -244,6 +297,8 @@ export function drawMap(canvas, state, nav, metaRef) {
     ctx.fill()
     ctx.restore()
   }
+
+  if (nav.previewPose) drawPreviewPose(ctx, map, geom, nav.previewPose)
 
   if (nav.showSavedPoints !== false) drawSavedPoints(ctx, map, geom, nav)
   drawSelectedWaypoints(ctx, map, geom, nav)

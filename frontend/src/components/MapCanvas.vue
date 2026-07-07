@@ -4,6 +4,7 @@ import { storeToRefs } from 'pinia'
 import { useTelemetryStore } from '../stores/telemetry.js'
 import { useWorkflowStore } from '../stores/workflow.js'
 import { usePointsStore } from '../stores/points.js'
+import { useReloc2dStore } from '../stores/reloc2d.js'
 import { drawMap, getCurrentMapGeom } from '../utils/mapDraw.js'
 import { canvasToMap, eventToCanvas } from '../utils/geometry.js'
 
@@ -19,9 +20,11 @@ const emit = defineEmits(['pick'])
 const telemetry = useTelemetryStore()
 const workflow = useWorkflowStore()
 const points = usePointsStore()
+const reloc = useReloc2dStore()
 const { state } = storeToRefs(telemetry)
 const { selectedWaypoints, finalHeadingPoint, manualHeadingDeg } = storeToRefs(workflow)
 const { savedPoints, editingPointId } = storeToRefs(points)
+const { previewPose } = storeToRefs(reloc)
 
 const canvasEl = ref(null)
 let observer = null
@@ -37,6 +40,7 @@ function render() {
     manualHeadingDeg: manualHeadingDeg.value,
     targetYaw: workflow.computeTargetYaw(state.value),
     showSavedPoints: props.showSavedPoints,
+    previewPose: previewPose.value,
   }
   drawMap(canvas, state.value, nav)
 }
@@ -69,7 +73,7 @@ onMounted(() => {
 })
 
 watch(
-  [state, selectedWaypoints, savedPoints, editingPointId, finalHeadingPoint, manualHeadingDeg],
+  [state, selectedWaypoints, savedPoints, editingPointId, finalHeadingPoint, manualHeadingDeg, previewPose],
   () => render(),
   { deep: false },
 )

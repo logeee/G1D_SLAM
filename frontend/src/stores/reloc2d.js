@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { api } from '../api/client.js'
 
 // 2D 重定位流程(Mapping Mode):三种方式 + 结果 + 应用到底盘。
@@ -20,6 +20,15 @@ export const useReloc2dStore = defineStore('reloc2d', () => {
   const saveIntervalSec = ref(10) // 输入框绑定值
   const config = ref(null) // { interval_sec, enabled, last_pose, path }
   const configBusy = ref(false)
+
+  // 候选位姿:结果出来后在地图上预览(橙色箭头),让用户看清落点再决定是否应用。
+  const previewPose = computed(() => {
+    // 窗口关闭(以任何方式)后不再显示候选箭头。
+    if (!open.value || step.value !== 'result' || running.value || error.value) return null
+    const p = result.value && result.value.pose
+    if (!p || p.x === null || p.x === undefined || p.y === null || p.y === undefined) return null
+    return { x: p.x, y: p.y, yaw: p.yaw, accepted: !!result.value.accepted }
+  })
 
   async function loadConfig() {
     try {
@@ -141,7 +150,7 @@ export const useReloc2dStore = defineStore('reloc2d', () => {
   }
 
   return {
-    open, step, running, picking, result, error, applied, applyError,
+    open, step, running, picking, result, error, applied, applyError, previewPose,
     saveIntervalSec, config, configBusy, loadConfig, applyInterval,
     openDialog, close, runGlobal, runJson, beginClickPick, onPicked, cancelPick, applyToChassis,
   }
