@@ -27,6 +27,7 @@ export const api = {
   getMappingStatus: () => getJson('/api/mapping/status'),
   getMappingList: () => getJson('/api/mapping/list'),
   getReloc2dConfig: () => getJson('/api/reloc2d/config'),
+  getControlStatus: () => getJson('/api/control/status'),
   getHealth: () => getJson('/api/health'),
   post: postJson,
 }

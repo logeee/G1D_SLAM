@@ -103,6 +103,13 @@ class BaseSensorNode(Node):
         fault_log_path: str,
         last_pose_file: str = "data/last_pose.json",
         last_pose_save_interval_sec: float = 10.0,
+        base_control_bin: str = "/home/unitree/unitree_sdk2/build/bin/g1d_simple_control",
+        jog_max_linear_mps: float = 0.3,
+        jog_max_angular_radps: float = 0.6,
+        jog_default_linear_mps: float = 0.15,
+        jog_default_angular_radps: float = 0.3,
+        jog_hold_duration_sec: float = 3600.0,
+        jog_deadman_timeout_sec: float = 1.0,
     ) -> None:
         super().__init__("base_sensor_visual_server")
         self.state = state
@@ -145,6 +152,21 @@ class BaseSensorNode(Node):
         self.column_height_timeout_sec = max(1.0, float(column_height_timeout_sec))
         self.column_height_min_m = float(column_height_min_m)
         self.column_height_max_m = float(column_height_max_m)
+        # Manual teleop jog of the base (reuses the column-control build dir/libs).
+        from ..control import JogController
+
+        self.jog = JogController(
+            binary=base_control_bin,
+            interface=self.column_control_interface,
+            libdir=self.column_control_libdir,
+            workdir=self.column_control_workdir,
+            max_linear_mps=jog_max_linear_mps,
+            max_angular_radps=jog_max_angular_radps,
+            default_linear_mps=jog_default_linear_mps,
+            default_angular_radps=jog_default_angular_radps,
+            hold_duration_sec=jog_hold_duration_sec,
+            deadman_timeout_sec=jog_deadman_timeout_sec,
+        )
         self.lift_height_url = str(lift_height_url or "").strip()
         self.lift_height_timeout_sec = max(0.2, min(5.0, float(lift_height_timeout_sec)))
         self.raw_nav_linear_speed_mps = max(0.02, min(0.35, float(raw_nav_linear_speed_mps)))
@@ -1702,6 +1724,17 @@ class BaseSensorNode(Node):
         if abs(value) < min_abs:
             return math.copysign(min_abs, value) if value else 0.0
         return max(-max_abs, min(max_abs, value))
+
+    def base_jog(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Start/refresh a held teleop jog of the base (see JogController)."""
+        return self.jog.move(payload or {})
+
+    def base_stop(self) -> Dict[str, Any]:
+        """Stop any active teleop jog of the base."""
+        return self.jog.stop()
+
+    def base_jog_status(self) -> Dict[str, Any]:
+        return self.jog.status()
 
     def publish_cmd_vel(self, linear_x: float = 0.0, angular_z: float = 0.0) -> None:
         msg = Twist()

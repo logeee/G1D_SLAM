@@ -29,6 +29,8 @@ from .api import mapping as mapping_api
 from .api import relocalization as relocalization_api
 from .api import reloc2d as reloc2d_api
 from .api import faults as faults_api
+from .api import control as control_api
+from .api import camera as camera_api
 
 
 _DEV_PLACEHOLDER_HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -103,6 +105,13 @@ def _build_node(args):
         fault_log_path=args.fault_log_path,
         last_pose_file=args.last_pose_file,
         last_pose_save_interval_sec=args.last_pose_save_interval_sec,
+        base_control_bin=args.base_control_bin,
+        jog_max_linear_mps=args.jog_max_linear_mps,
+        jog_max_angular_radps=args.jog_max_angular_radps,
+        jog_default_linear_mps=args.jog_default_linear_mps,
+        jog_default_angular_radps=args.jog_default_angular_radps,
+        jog_hold_duration_sec=args.jog_hold_duration_sec,
+        jog_deadman_timeout_sec=args.jog_deadman_timeout_sec,
     )
     return state, point_store, node
 
@@ -116,6 +125,17 @@ def create_app(args) -> FastAPI:
         ctx.state = state
         ctx.node = node
         ctx.point_store = point_store
+
+        from .camera import HeadCameraStreamer
+
+        ctx.camera = HeadCameraStreamer(
+            host=args.head_camera_host,
+            request_port=args.head_camera_request_port,
+            zmq_port=args.head_camera_zmq_port,
+            jpeg_quality=args.head_camera_jpeg_quality,
+            max_fps=args.head_camera_max_fps,
+            eye=args.head_camera_eye,
+        )
 
         stop_event = threading.Event()
 
@@ -163,6 +183,15 @@ def create_app(args) -> FastAPI:
             ros_thread.join(timeout=2.0)
             pose_thread.join(timeout=2.0)
             try:
+                node.jog.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                if ctx.camera is not None:
+                    ctx.camera.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
                 node.destroy_node()
             except Exception:  # noqa: BLE001
                 pass
@@ -180,6 +209,8 @@ def create_app(args) -> FastAPI:
         relocalization_api,
         reloc2d_api,
         faults_api,
+        control_api,
+        camera_api,
     ):
         app.include_router(module.router)
 

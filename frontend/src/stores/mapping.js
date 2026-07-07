@@ -8,6 +8,9 @@ import { useDialogStore } from './dialog.js'
 export const useMappingStore = defineStore('mapping', () => {
   const activeView = ref('dashboard') // 'dashboard' | 'mapping'
   const busy = ref(false)
+  // 「准备采集」:先显示右侧相机+遥控,让操作者把机器人开到想开始的位置,
+  // 再点「确认开始采集」真正清图建图。prepared 只是前端 UI 状态,不动底盘。
+  const prepared = ref(false)
 
   function enterMapping() {
     activeView.value = 'mapping'
@@ -16,7 +19,16 @@ export const useMappingStore = defineStore('mapping', () => {
 
   function exitMapping() {
     activeView.value = 'dashboard'
+    prepared.value = false
     resetMapCache()
+  }
+
+  function prepareMapping() {
+    prepared.value = true
+  }
+
+  function cancelPrepare() {
+    prepared.value = false
   }
 
   async function startMapping() {
@@ -43,6 +55,7 @@ export const useMappingStore = defineStore('mapping', () => {
     try {
       const data = await api.post('/api/mapping/stop', {})
       if (!data.ok) await dialog.alert('结束采集失败 / Stop mapping failed: ' + (data.error || 'unknown'), { title: '出错' })
+      else prepared.value = false
     } catch (err) {
       await dialog.alert('结束采集出错 / Stop mapping error: ' + err, { title: '出错' })
     } finally {
@@ -120,5 +133,5 @@ export const useMappingStore = defineStore('mapping', () => {
     }
   }
 
-  return { activeView, busy, enterMapping, exitMapping, startMapping, stopMapping, saveMap, loadMap }
+  return { activeView, busy, prepared, enterMapping, exitMapping, prepareMapping, cancelPrepare, startMapping, stopMapping, saveMap, loadMap }
 })
