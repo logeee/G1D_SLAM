@@ -70,5 +70,12 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <canvas ref="canvasEl" class="map-canvas" @click="onClick"></canvas>
+  <!-- When not interactive (e.g. Mapping Mode) clicks are a no-op; show the
+       default cursor instead of the crosshair so it doesn't look clickable. -->
+  <canvas
+    ref="canvasEl"
+    class="map-canvas"
+    :style="interactive ? null : { cursor: 'default' }"
+    @click="onClick"
+  ></canvas>
 </template>

@@ -33,7 +33,9 @@ const mappingColor = computed(() => {
       <span class="map-build-status" :style="{ color: mappingColor }">{{ mappingText }}</span>
     </div>
     <div class="mapping-canvas-host">
-      <div class="canvas-wrap"><MapCanvas interactive /></div>
+      <!-- Mapping mode is view-only: no click-to-add waypoint here.
+           (Dashboard 的 SLAM Map 仍保留打点，见 MapPanel.vue) -->
+      <div class="canvas-wrap"><MapCanvas /></div>
     </div>
   </div>
 </template>

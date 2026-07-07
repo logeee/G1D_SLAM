@@ -10,6 +10,7 @@ import { useColumnHeightStore } from './stores/columnHeight.js'
 import ConnectionStatus from './components/ConnectionStatus.vue'
 import DashboardView from './views/DashboardView.vue'
 import MappingView from './views/MappingView.vue'
+import AppDialog from './components/AppDialog.vue'
 
 const telemetry = useTelemetryStore()
 const workflow = useWorkflowStore()
@@ -81,4 +82,5 @@ onBeforeUnmount(() => {
   </header>
   <MappingView v-if="activeView === 'mapping'" />
   <DashboardView v-else />
+  <AppDialog />
 </template>
