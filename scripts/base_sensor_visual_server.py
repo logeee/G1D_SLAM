@@ -3472,6 +3472,7 @@ HTML = r"""<!doctype html>
         <div class="metric"><div class="label">X</div><div id="odomX" class="value">--</div></div>
         <div class="metric"><div class="label">Y</div><div id="odomY" class="value">--</div></div>
         <div class="metric"><div class="label">Yaw</div><div id="odomYaw" class="value">--</div></div>
+        <div class="metric"><div class="label">&#31435;&#26609;&#39640;&#24230;</div><div id="liftPhysicalHeight" class="value">--</div></div>
         <div class="metric"><div class="label">Track</div><div id="trackCount" class="value">--</div></div>
         <div class="metric"><div class="label">航点</div><div id="waypointCount" class="value">0</div></div>
         <div class="metric"><div class="label">规划路径</div><div id="planCount" class="value">--</div></div>
@@ -3672,6 +3673,7 @@ HTML = r"""<!doctype html>
     let workflowActions = [];
     let editingActionId = null;
     let lastLiftHeight = null;
+    let liftHeightRefreshInFlight = false;
     let draggedActionId = null;
     let workflowRun = {
       running: false,
@@ -4881,7 +4883,26 @@ HTML = r"""<!doctype html>
       return data;
     }
 
+    function updateLiftHeightReadout(data) {
+      const card = document.getElementById('liftPhysicalHeight');
+      if (!card) return;
+      if (!data || data.ok === false || !Number.isFinite(Number(data.physical_height_m))) {
+        card.textContent = '--';
+        card.title = data?.error || '';
+        return;
+      }
+      const physical = Number(data.physical_height_m);
+      const max = Number.isFinite(Number(data.physical_max_m))
+        ? Number(data.physical_max_m)
+        : (Number.isFinite(Number(data.full_travel_m)) ? Number(data.full_travel_m) : null);
+      card.textContent = `${physical.toFixed(3)} m`;
+      card.title = max !== null
+        ? `physical ${physical.toFixed(3)} m / range 0~${max.toFixed(3)} m`
+        : `physical ${physical.toFixed(3)} m`;
+    }
+
     function updateColumnHeightStatus(data) {
+      updateLiftHeightReadout(data);
       const el = document.getElementById('columnHeightStatus');
       if (!el) return;
       if (!data || data.ok === false) {
@@ -4900,6 +4921,8 @@ HTML = r"""<!doctype html>
     }
 
     async function refreshColumnHeightStatus({ quiet = false } = {}) {
+      if (liftHeightRefreshInFlight) return lastLiftHeight;
+      liftHeightRefreshInFlight = true;
       try {
         const res = await fetch('/api/lift_height', { cache: 'no-store' });
         const data = await res.json();
@@ -4911,6 +4934,8 @@ HTML = r"""<!doctype html>
         updateColumnHeightStatus(data);
         if (!quiet) showNavMessage('bad', `立柱：<strong>高度读取失败</strong> ${err}`);
         return data;
+      } finally {
+        liftHeightRefreshInFlight = false;
       }
     }
 
@@ -6294,6 +6319,7 @@ HTML = r"""<!doctype html>
 
     window.addEventListener('resize', () => { cachedMapSeq = -1; tick(); });
     setInterval(tick, 500);
+    setInterval(() => refreshColumnHeightStatus({ quiet: true }), 1000);
     setInterval(loadRelocalizationStatus, 5000);
     loadWorkflowCache();
     updateActionBuilderVisibility();
