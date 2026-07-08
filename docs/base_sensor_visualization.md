@@ -302,19 +302,24 @@ GET http://<机器人IP>:28089/api/lift_height
 
 - `physical_height_m`：当前立柱真实物理高度，单位 m，默认范围 `0.0 ~ 0.427`。
 - `hispeed_y_m`：DDS `rt/hispeed_state` 的 raw y 值。
-- `lift_offset_m`：raw 到物理高度的偏移。优先使用本机标定文件，未标定时才使用启动参数默认值。
-- `sdk_min_m` / `sdk_max_m`：raw 控制范围。标定后 `sdk_min_m` 等于最低位 raw 值。
+- `lift_offset_m`：raw 到物理高度的偏移。默认每次开机自动重新标定，优先使用本次 boot 的标定文件。
+- `sdk_min_m` / `sdk_max_m`：raw 控制范围。本次 boot 标定后 `sdk_min_m` 等于开机自动降到底后的最低位 raw 值。
 - `full_travel_m`：物理总行程，默认 `0.427`。
-- `calibration_source`：`file` 表示正在使用本机标定文件，`arg_default` 表示仍在用启动参数默认值。
+- `calibration_source`：`auto_boot_min_calibration` 表示使用本次开机自动标定，`manual_min_calibration` 表示人工标定，`stale_file_pending_auto_boot` 表示旧 boot 标定已失效、正在等待本次开机标定。
+- `auto_calibration`：自动标定后台任务状态，例如 `waiting_for_boot_zero` / `sampling` / `done` / `skipped` / `failed`。
 
-首次部署或更换机器人后，先把立柱降到最低，再标定当前最低位为物理 `0m`：
+默认开机流程：服务启动后等待 `G1D_LIFT_AUTO_CALIBRATE_DELAY_SEC`（默认 75 秒），让 G1-D 完成自动降到底；随后采样 `hispeed_y_m`，稳定后写入本次 boot 的 offset。标定文件默认保存在 `/home/unitree/.config/g1d_lift_height/calibration.json`，并带有 `boot_id`；下次开机 `boot_id` 变化后旧 offset 不再当真值。
+
+自动标定完成前，接口会返回 `offset_valid=false`，此时不要使用 `physical_height_m` 做控制。
+
+如果现场已经确认立柱在最低位，也可以手动把当前最低位标定为物理 `0m`：
 
 ```bash
 curl -s http://127.0.0.1:28089/api/calibrate_min
 curl -s http://127.0.0.1:28089/api/basic_status
 ```
 
-标定文件默认保存在 `/home/unitree/.config/g1d_lift_height/calibration.json`。如果误标定，可以删除标定并回到启动参数默认值：
+如果误标定，可以删除标定并等待自动标定或重新手动标定：
 
 ```bash
 curl -s http://127.0.0.1:28089/api/reset_calibration
@@ -326,9 +331,9 @@ curl -s http://127.0.0.1:28089/api/reset_calibration
 bash scripts/g1d_lift_height_service.sh \
   --dds-interface eth0 \
   --dds-hispeed-topic rt/hispeed_state \
-  --sdk-min-m -0.1851 \
-  --sdk-max-m 0.2469 \
-  --full-travel-m 0.427
+  --full-travel-m 0.427 \
+  --auto-calibrate-delay-sec 75 \
+  --auto-calibrate-max-uptime-sec 300
 ```
 
 机械臂模块 v2.1 的 ROS Topic 约定：
