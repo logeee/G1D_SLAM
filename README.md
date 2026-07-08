@@ -208,9 +208,9 @@ GET http://<机器人IP>:28089/api/lift_height
 - `sdk_min_m` / `sdk_max_m`：raw 控制范围。本次 boot 标定后 `sdk_min_m` 等于开机自动降到底后的最低位 raw 值。
 - `full_travel_m`：物理总行程，默认 `0.427`。
 - `calibration_source`：`auto_boot_min_calibration` 表示使用本次开机自动标定，`manual_min_calibration` 表示人工标定，`stale_file_pending_auto_boot` 表示旧 boot 标定已失效、正在等待本次开机标定。
-- `auto_calibration`：自动标定后台任务状态，例如 `waiting_for_boot_zero` / `sampling` / `done` / `skipped` / `failed`。
+- `auto_calibration`：自动标定后台任务状态，例如 `detecting_min` / `done` / `skipped` / `failed`，里面会带 `min_seen_y_m`、`stable_count` 等调试字段。
 
-默认开机流程：服务启动后等待 `G1D_LIFT_AUTO_CALIBRATE_DELAY_SEC`（默认 75 秒），让 G1-D 完成自动降到底；随后采样 `hispeed_y_m`，稳定后写入本次 boot 的 offset。标定文件默认保存在 `/home/unitree/.config/g1d_lift_height/calibration.json`，并带有 `boot_id`；下次开机 `boot_id` 变化后旧 offset 不再当真值。
+默认开机流程：服务启动后读取本体 Linux `/proc/uptime`。如果仍在开机窗口内（默认 300 秒），后台持续监听 DDS `rt/hispeed_state`，记录本次开机看到的最低 `hispeed_y_m`；当当前值连续 3 次接近最低值（默认阈值 `0.002m`）时，将该最低值写成本次 boot 的 offset。标定文件默认保存在 `/home/unitree/.config/g1d_lift_height/calibration.json`，并带有 `boot_id`；下次开机 `boot_id` 变化后旧 offset 不再当真值。
 
 自动标定完成前，接口会返回 `offset_valid=false`，此时不要使用 `physical_height_m` 做控制。
 
@@ -234,8 +234,9 @@ bash scripts/g1d_lift_height_service.sh \
   --dds-interface eth0 \
   --dds-hispeed-topic rt/hispeed_state \
   --full-travel-m 0.427 \
-  --auto-calibrate-delay-sec 75 \
-  --auto-calibrate-max-uptime-sec 300
+  --auto-calibrate-max-uptime-sec 300 \
+  --auto-calibrate-stable-threshold-m 0.002 \
+  --auto-calibrate-stable-count 3
 ```
 
 点位 API：
