@@ -19,6 +19,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 
 
 DEFAULT_BIND = "0.0.0.0"
@@ -29,6 +30,7 @@ DEFAULT_SDK2PY_PATH = "/home/unitree/unitree_sdk2_python"
 DEFAULT_SDK_MIN_M = -0.1851
 DEFAULT_SDK_MAX_M = 0.2469
 DEFAULT_FULL_TRAVEL_M = 0.427
+DEFAULT_CALIBRATION_PATH = "/home/unitree/.config/g1d_lift_height/calibration.json"
 
 
 def finite_or_none(value: Any, ndigits: Optional[int] = None) -> Optional[float]:
@@ -60,6 +62,25 @@ def uptime_sec() -> Optional[float]:
         return float(Path("/proc/uptime").read_text().split()[0])
     except Exception:
         return None
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="milliseconds")
+
+
+def load_json(path: Path) -> Optional[dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
 
 
 class DdsHispeedReader:
@@ -105,6 +126,7 @@ class LiftHeightService:
         self.reader: Optional[DdsHispeedReader] = None
         self.reader_error: Optional[str] = None
         self.lock = threading.Lock()
+        self.calibration_path = Path(args.calibration_path).expanduser()
 
     def _reader_instance(self) -> Optional[DdsHispeedReader]:
         with self.lock:
@@ -122,17 +144,70 @@ class LiftHeightService:
                 self.reader_error = str(exc)
                 return None
 
+    def latest_raw(self) -> tuple[Optional[float], float]:
+        reader = self._reader_instance()
+        if reader is not None:
+            return reader.latest(self.args.wait_sec)
+        return None, 0.0
+
+    def calibration(self) -> tuple[float, str, Optional[dict[str, Any]]]:
+        saved = load_json(self.calibration_path)
+        if saved is not None:
+            saved_min = finite_or_none(saved.get("sdk_min_m"))
+            if saved_min is not None:
+                return float(saved_min), "file", saved
+        return float(self.args.sdk_min_m), "arg_default", saved
+
+    def save_current_as_min(self, *, note: str = "") -> dict[str, Any]:
+        raw_y_m, updated_at = self.latest_raw()
+        if raw_y_m is None:
+            return {
+                "ok": False,
+                "error": self.reader_error or "no hispeed frame",
+                "calibration_path": str(self.calibration_path),
+            }
+
+        full_travel = float(self.args.full_travel_m)
+        payload = {
+            "sdk_min_m": raw_y_m,
+            "sdk_max_m": raw_y_m + full_travel,
+            "full_travel_m": full_travel,
+            "source": "current_hispeed_y_as_physical_min",
+            "note": note,
+            "boot_id": boot_id(),
+            "uptime_sec": uptime_sec(),
+            "hispeed_y_m": raw_y_m,
+            "data_age_sec": time.time() - updated_at if updated_at > 0 else None,
+            "updated_at": now_iso(),
+        }
+        atomic_write_json(self.calibration_path, payload)
+        return {
+            "ok": True,
+            "message": "current hispeed_y_m saved as physical zero/min height",
+            "calibration_path": str(self.calibration_path),
+            "calibration": payload,
+        }
+
+    def reset_calibration(self) -> dict[str, Any]:
+        try:
+            self.calibration_path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "calibration_path": str(self.calibration_path)}
+        return {"ok": True, "message": "calibration removed; service will use argument defaults", "calibration_path": str(self.calibration_path)}
+
     def status(self) -> dict[str, Any]:
         started = time.time()
-        reader = self._reader_instance()
-        raw_y_m = None
-        updated_at = 0.0
-        if reader is not None:
-            raw_y_m, updated_at = reader.latest(self.args.wait_sec)
+        raw_y_m, updated_at = self.latest_raw()
 
-        sdk_min = float(self.args.sdk_min_m)
-        sdk_max = float(self.args.sdk_max_m)
         full_travel = float(self.args.full_travel_m)
+        sdk_min, calibration_source, calibration = self.calibration()
+        saved_sdk_max = finite_or_none(calibration.get("sdk_max_m")) if calibration else None
+        if calibration_source == "file":
+            sdk_max = saved_sdk_max if saved_sdk_max is not None else sdk_min + full_travel
+        else:
+            sdk_max = float(self.args.sdk_max_m)
         lift_offset = sdk_min
         physical_height = None
         if raw_y_m is not None:
@@ -156,7 +231,9 @@ class LiftHeightService:
             "sdk_max_m": finite_or_none(sdk_max, 6),
             "physical_min_m": 0.0,
             "physical_max_m": finite_or_none(full_travel, 6),
-            "offset_valid": True,
+            "offset_valid": bool(calibration_source == "file" or self.args.allow_arg_default),
+            "calibration_source": calibration_source,
+            "calibration_path": str(self.calibration_path),
             "boot_id": boot_id(),
             "uptime_sec": finite_or_none(uptime_sec(), 3),
             "data_age_sec": finite_or_none(data_age, 3),
@@ -166,7 +243,7 @@ class LiftHeightService:
                 "unitree_sdk2py_path": self.args.unitree_sdk2py_path,
             },
             "timestamp": now,
-            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+            "updated_at": now_iso(),
             "elapsed_ms": round((time.time() - started) * 1000.0, 1),
         }
 
@@ -192,12 +269,13 @@ def make_handler(service: LiftHeightService) -> type[BaseHTTPRequestHandler]:
         def do_OPTIONS(self) -> None:
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "*")
             self.end_headers()
 
         def do_GET(self) -> None:
-            path = self.path.split("?", 1)[0]
+            parsed = urlparse(self.path)
+            path = parsed.path
             if path == "/health":
                 payload = service.status()
                 self.write_json({"ok": payload.get("ok", False), "service": payload.get("service"), "error": payload.get("error")})
@@ -205,6 +283,37 @@ def make_handler(service: LiftHeightService) -> type[BaseHTTPRequestHandler]:
             if path in ("/api/basic_status", "/api/lift_height", "/api/offset", "/api/status"):
                 payload = service.status()
                 self.write_json(payload, 200 if payload.get("ok") else 503)
+                return
+            if path == "/api/calibrate_min":
+                query = parse_qs(parsed.query)
+                note = str(query.get("note", [""])[0])
+                result = service.save_current_as_min(note=note)
+                payload = service.status()
+                payload["calibration_result"] = result
+                self.write_json(payload, 200 if result.get("ok") else 503)
+                return
+            if path == "/api/reset_calibration":
+                result = service.reset_calibration()
+                payload = service.status()
+                payload["calibration_result"] = result
+                self.write_json(payload, 200 if result.get("ok") else 503)
+                return
+            self.write_json({"ok": False, "error": f"not found: {path}"}, 404)
+
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == "/api/calibrate_min":
+                result = service.save_current_as_min(note="POST /api/calibrate_min")
+                payload = service.status()
+                payload["calibration_result"] = result
+                self.write_json(payload, 200 if result.get("ok") else 503)
+                return
+            if path == "/api/reset_calibration":
+                result = service.reset_calibration()
+                payload = service.status()
+                payload["calibration_result"] = result
+                self.write_json(payload, 200 if result.get("ok") else 503)
                 return
             self.write_json({"ok": False, "error": f"not found: {path}"}, 404)
 
@@ -221,6 +330,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sdk-min-m", type=float, default=float(os.environ.get("G1D_LIFT_SDK_MIN_M", DEFAULT_SDK_MIN_M)))
     parser.add_argument("--sdk-max-m", type=float, default=float(os.environ.get("G1D_LIFT_SDK_MAX_M", DEFAULT_SDK_MAX_M)))
     parser.add_argument("--full-travel-m", type=float, default=float(os.environ.get("G1D_LIFT_FULL_TRAVEL_M", DEFAULT_FULL_TRAVEL_M)))
+    parser.add_argument("--calibration-path", default=os.environ.get("G1D_LIFT_CALIBRATION_PATH", DEFAULT_CALIBRATION_PATH))
+    parser.add_argument("--allow-arg-default", action="store_true", default=os.environ.get("G1D_LIFT_ALLOW_ARG_DEFAULT", "1").lower() in ("1", "true", "yes"))
     parser.add_argument("--wait-sec", type=float, default=float(os.environ.get("G1D_LIFT_WAIT_SEC", 1.0)))
     parser.add_argument("--quiet", action="store_true", default=os.environ.get("G1D_LIFT_QUIET", "1").lower() in ("1", "true", "yes"))
     return parser

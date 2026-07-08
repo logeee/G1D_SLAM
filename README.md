@@ -204,9 +204,23 @@ GET http://<机器人IP>:28089/api/lift_height
 
 - `physical_height_m`：当前立柱真实物理高度，单位 m，默认范围 `0.0 ~ 0.427`。
 - `hispeed_y_m`：DDS `rt/hispeed_state` 里的 raw y 值。
-- `lift_offset_m`：raw 到物理高度的偏移，默认 `-0.1851`。
-- `sdk_min_m` / `sdk_max_m`：raw 控制范围，默认 `-0.1851 ~ 0.2469`。
+- `lift_offset_m`：raw 到物理高度的偏移。优先使用标定文件，未标定时才使用参数默认值。
+- `sdk_min_m` / `sdk_max_m`：raw 控制范围。标定后 `sdk_min_m` 等于最低位 raw 值。
 - `full_travel_m`：物理总行程，默认 `0.427`。
+- `calibration_source`：`file` 表示正在使用本机标定文件，`arg_default` 表示仍在用启动参数默认值。
+
+首次部署或更换机器人后，先把立柱降到最低，再标定当前最低位为物理 `0m`：
+
+```bash
+curl -s http://127.0.0.1:28089/api/calibrate_min
+curl -s http://127.0.0.1:28089/api/basic_status
+```
+
+标定文件默认保存在 `/home/unitree/.config/g1d_lift_height/calibration.json`。如果误标定，可以删除标定并回到启动参数默认值：
+
+```bash
+curl -s http://127.0.0.1:28089/api/reset_calibration
+```
 
 服务默认通过 `unitree_sdk2_python` 订阅 DDS topic `rt/hispeed_state`，不依赖 `ros2 topic echo`。如需改网卡或标定范围，可以编辑 systemd 环境变量或直接带参数启动：
 
