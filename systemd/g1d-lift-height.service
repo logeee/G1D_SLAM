@@ -1,0 +1,17 @@
+[Unit]
+Description=G1-D Lift Height HTTP Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/home/unitree/G1D_SLAM
+ExecStart=/bin/bash scripts/g1d_lift_height_service.sh
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

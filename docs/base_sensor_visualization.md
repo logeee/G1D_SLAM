@@ -27,26 +27,40 @@ nohup bash scripts/base_sensor_visual_server.sh > /tmp/base_sensor_visual_server
 curl -s http://127.0.0.1:18083/api/health
 ```
 
+立柱高度常驻服务默认监听 `0.0.0.0:28089`，给 18083 页面和外部前端提供当前立柱真实物理高度：
+
+```bash
+cd ~/G1D_SLAM
+nohup bash scripts/g1d_lift_height_service.sh > /tmp/g1d_lift_height_service_28089.log 2>&1 &
+curl -s http://127.0.0.1:28089/api/basic_status
+```
+
+18083 后端默认读取 `http://127.0.0.1:28089/api/basic_status`。如果这个服务没有启动，页面会显示“当前立柱高度：读取失败 / Connection refused”。
+
 ## 开机启动
 
 安装 systemd 服务：
 
 ```bash
 cd ~/G1D_SLAM
+sudo cp systemd/g1d-lift-height.service /etc/systemd/system/
 sudo cp systemd/slamtec-base-visual.service /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now g1d-lift-height.service
 sudo systemctl enable --now slamtec-base-visual.service
 ```
 
 查看状态：
 
 ```bash
+systemctl status g1d-lift-height.service --no-pager
 systemctl status slamtec-base-visual.service --no-pager
 ```
 
 查看日志：
 
 ```bash
+journalctl -u g1d-lift-height.service -f
 journalctl -u slamtec-base-visual.service -f
 ```
 
@@ -266,6 +280,41 @@ curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
 curl -s -X POST http://127.0.0.1:18083/api/actions/execute \
   -H 'Content-Type: application/json' \
   -d '{"type":"arm_task","phase":"PICK","target_object":"Xizi_Liqun","dry_run":true}'
+```
+
+## 立柱高度服务 API
+
+常驻服务：
+
+```bash
+systemctl status g1d-lift-height.service --no-pager
+curl -s http://127.0.0.1:28089/api/basic_status
+```
+
+外部前端直接读取：
+
+```text
+GET http://<机器人IP>:28089/api/basic_status
+GET http://<机器人IP>:28089/api/lift_height
+```
+
+主要字段：
+
+- `physical_height_m`：当前立柱真实物理高度，单位 m，默认范围 `0.0 ~ 0.427`。
+- `hispeed_y_m`：DDS `rt/hispeed_state` 的 raw y 值。
+- `lift_offset_m`：raw 到物理高度的偏移，默认 `-0.1851`。
+- `sdk_min_m` / `sdk_max_m`：raw 控制范围，默认 `-0.1851 ~ 0.2469`。
+- `full_travel_m`：物理总行程，默认 `0.427`。
+
+服务通过 `unitree_sdk2_python` 直接订阅 DDS，不依赖 `ros2 topic echo`。手动启动示例：
+
+```bash
+bash scripts/g1d_lift_height_service.sh \
+  --dds-interface eth0 \
+  --dds-hispeed-topic rt/hispeed_state \
+  --sdk-min-m -0.1851 \
+  --sdk-max-m 0.2469 \
+  --full-travel-m 0.427
 ```
 
 机械臂模块 v2.1 的 ROS Topic 约定：

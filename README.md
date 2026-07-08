@@ -28,6 +28,16 @@ nohup bash scripts/base_sensor_visual_server.sh > /tmp/base_sensor_visual_server
 curl -s http://127.0.0.1:18083/api/health
 ```
 
+立柱高度常驻服务用于给 18083 页面和其他前端提供当前立柱真实物理高度，默认监听 `0.0.0.0:28089`：
+
+```bash
+cd ~/G1D_SLAM
+nohup bash scripts/g1d_lift_height_service.sh > /tmp/g1d_lift_height_service_28089.log 2>&1 &
+curl -s http://127.0.0.1:28089/api/basic_status
+```
+
+18083 页面内部默认读取 `http://127.0.0.1:28089/api/basic_status`，所以这个服务没启动时页面会显示“当前立柱高度：读取失败 / Connection refused”。
+
 本地电脑直接打开：
 
 ```text
@@ -63,20 +73,24 @@ http://192.168.0.149:18083/
 
 ```bash
 cd ~/G1D_SLAM
+sudo cp systemd/g1d-lift-height.service /etc/systemd/system/
 sudo cp systemd/slamtec-base-visual.service /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now g1d-lift-height.service
 sudo systemctl enable --now slamtec-base-visual.service
 ```
 
 查看状态：
 
 ```bash
+systemctl status g1d-lift-height.service --no-pager
 systemctl status slamtec-base-visual.service --no-pager
 ```
 
 查看日志：
 
 ```bash
+journalctl -u g1d-lift-height.service -f
 journalctl -u slamtec-base-visual.service -f
 ```
 
@@ -95,8 +109,11 @@ source /unitree/module/slamware_service_pc4/install/setup.bash
 
 ```text
 scripts/base_sensor_visual_server.py   Web + ROS2 可视化服务
-scripts/base_sensor_visual_server.sh   机器人启动脚本
-systemd/slamtec-base-visual.service    开机启动服务
+scripts/base_sensor_visual_server.sh   18083 页面启动脚本
+scripts/g1d_lift_height_service.py     28089 立柱高度常驻服务
+scripts/g1d_lift_height_service.sh     立柱高度服务启动脚本
+systemd/slamtec-base-visual.service    18083 开机启动服务
+systemd/g1d-lift-height.service        28089 开机启动服务
 docs/base_sensor_visualization.md      中文使用说明
 ```
 
@@ -166,6 +183,41 @@ curl -s -X POST http://127.0.0.1:18083/api/navigation/cancel -d '{}'
 - `仅执行导航` 只用于调试导航，会跳过非导航动作。
 - `停止` 会取消 Slamware 导航，并向机械臂发布停止/复位 phase。默认发布 `RESET`、`SUCTION_STOP`、`MOTION_STOP`，可用 `--arm-stop-phases` 调整。
 - 机械臂任务会等待 `/arm_control/task_status` 中同一个 `task_id` 的终态：`DONE` 成功，`FAILED` / `REJECTED` 失败，默认超时 120 秒。
+
+## 立柱高度服务 API
+
+常驻服务：
+
+```bash
+systemctl status g1d-lift-height.service --no-pager
+curl -s http://127.0.0.1:28089/api/basic_status
+```
+
+同事前端可以直接读取：
+
+```text
+GET http://<机器人IP>:28089/api/basic_status
+GET http://<机器人IP>:28089/api/lift_height
+```
+
+主要返回字段：
+
+- `physical_height_m`：当前立柱真实物理高度，单位 m，默认范围 `0.0 ~ 0.427`。
+- `hispeed_y_m`：DDS `rt/hispeed_state` 里的 raw y 值。
+- `lift_offset_m`：raw 到物理高度的偏移，默认 `-0.1851`。
+- `sdk_min_m` / `sdk_max_m`：raw 控制范围，默认 `-0.1851 ~ 0.2469`。
+- `full_travel_m`：物理总行程，默认 `0.427`。
+
+服务默认通过 `unitree_sdk2_python` 订阅 DDS topic `rt/hispeed_state`，不依赖 `ros2 topic echo`。如需改网卡或标定范围，可以编辑 systemd 环境变量或直接带参数启动：
+
+```bash
+bash scripts/g1d_lift_height_service.sh \
+  --dds-interface eth0 \
+  --dds-hispeed-topic rt/hispeed_state \
+  --sdk-min-m -0.1851 \
+  --sdk-max-m 0.2469 \
+  --full-travel-m 0.427
+```
 
 点位 API：
 
