@@ -1,0 +1,21 @@
+[Unit]
+Description=G1D SLAM Dashboard (frontend + API on :18083)
+# 后端会轮询立柱服务(:28089)读取立柱高度并做物理高度控制，
+# 因此在立柱服务之后启动，保证相关功能可用。
+After=network-online.target g1d-lift-height.service
+Wants=network-online.target g1d-lift-height.service
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/home/unitree/G1D_SLAM
+# run.sh 内部已 source ROS foxy 环境，并用 /usr/bin/python3 启动，默认端口 18083。
+# 前端静态页需已构建到 frontend/dist（改前端后执行 ./start.sh 或 cd frontend && npm run build 重建）。
+ExecStart=/bin/bash backend/run.sh
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -2,7 +2,7 @@
 
 The argument list is ported verbatim from the original monolith's main(), so all
 existing flags keep working. Only two changes vs. the legacy server:
-  - default --port is 18090 (was 18083)
+  - default --port is 18083
   - added --frontend-dist to locate the built Vue app (frontend/dist)
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="FastAPI web dashboard for base laser/map/odom/basic sensors.")
     parser.add_argument("--bind", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=18090)
+    parser.add_argument("--port", type=int, default=18083)
     parser.add_argument("--scan-topic", default="/slamware_ros_sdk_server_node/scan")
     parser.add_argument("--map-topic", default="/slamware_ros_sdk_server_node/map")
     parser.add_argument("--odom-topic", action="append", default=["/slamware_ros_sdk_server_node/odom"])

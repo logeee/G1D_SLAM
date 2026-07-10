@@ -1,11 +1,11 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
-// The FastAPI backend (backend/app/main.py) serves the REST API on port 18090.
+// The FastAPI backend (backend/app/main.py) serves the REST API on port 18083.
 // In dev we run Vite on 18089 and proxy /api to the backend so the browser sees a
 // single origin (no CORS needed). In production the backend serves the built dist/
 // directly, so the same relative /api paths keep working.
-const BACKEND_TARGET = process.env.VITE_BACKEND_TARGET || 'http://127.0.0.1:18090'
+const BACKEND_TARGET = process.env.VITE_BACKEND_TARGET || 'http://127.0.0.1:18083'
 
 export default defineConfig({
   plugins: [vue()],

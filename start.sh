@@ -2,11 +2,11 @@
 # One-shot launcher for the G1D SLAM dashboard (frontend + backend).
 #
 #   ./start.sh            # prod: build the Vue app, then run the FastAPI backend
-#                         #       which serves dist/ AND the API on :18090 (single port)
-#   ./start.sh dev        # dev:  run backend (:18090) + Vite dev server (:18089)
+#                         #       which serves dist/ AND the API on :18083 (single port)
+#   ./start.sh dev        # dev:  run backend (:18083) + Vite dev server (:18089)
 #                         #       concurrently; Ctrl+C stops both cleanly
 #
-# Env overrides: BACKEND_PORT (18090), FRONTEND_PORT (18089), BIND (0.0.0.0)
+# Env overrides: BACKEND_PORT (18083), FRONTEND_PORT (18089), BIND (0.0.0.0)
 set -eo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -14,7 +14,7 @@ REPO_ROOT="$(pwd)"
 
 MODE="${1:-prod}"
 BIND="${BIND:-0.0.0.0}"
-BACKEND_PORT="${BACKEND_PORT:-18090}"
+BACKEND_PORT="${BACKEND_PORT:-18083}"
 FRONTEND_PORT="${FRONTEND_PORT:-18089}"
 
 # Make nvm's node/npm available (frontend build/dev needs it).

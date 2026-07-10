@@ -23,4 +23,4 @@ fi
 # fastapi/uvicorn/pydantic are installed for this interpreter via `pip install --user`.
 PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
 
-exec "$PYTHON_BIN" -m backend.app.main --bind 0.0.0.0 --port 18090 "$@"
+exec "$PYTHON_BIN" -m backend.app.main --bind 0.0.0.0 --port 18083 "$@"

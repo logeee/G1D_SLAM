@@ -12,7 +12,7 @@
 
 ## 通用约定
 
-- **服务地址**：后端 `http://<host>:18090`。开发模式下前端跑在 `:18089`，由 Vite 把 `/api/*` 代理到 `:18090`；生产模式由后端同端口托管前端静态页 + API。
+- **服务地址**：后端 `http://<host>:18083`。开发模式下前端跑在 `:18089`，由 Vite 把 `/api/*` 代理到 `:18083`；生产模式由后端同端口托管前端静态页 + API。
 - **响应格式**：统一 `application/json`（`StrictJSONResponse`，紧凑分隔符、`allow_nan=false`）。
 - **通用返回结构**：多数接口返回 `{ "ok": true, ... }`；失败返回 `{ "ok": false, "error": "<原因>" }`。
 - **HTTP 状态码**：`400` 请求体非法 / `413` 请求体过大（>64KiB）/ `500` 服务端异常 / `503` 依赖不可用（如相机流未就绪）。
@@ -52,7 +52,7 @@
 
 示例：
 ```bash
-curl -X POST http://127.0.0.1:18090/api/control/jog \
+curl -X POST http://127.0.0.1:18083/api/control/jog \
   -H 'Content-Type: application/json' \
   -d '{"action":"forward","speed":0.15}'
 ```
@@ -156,7 +156,7 @@ curl -X POST http://127.0.0.1:18090/api/control/jog \
 
 示例：
 ```bash
-curl -X POST http://127.0.0.1:18090/api/reloc2d/run \
+curl -X POST http://127.0.0.1:18083/api/reloc2d/run \
   -H 'Content-Type: application/json' \
   -d '{"method":"click","init":{"x":1.2,"y":-3.4},"apply":false}'
 ```
@@ -224,8 +224,8 @@ curl -X POST http://127.0.0.1:18090/api/reloc2d/run \
 ### 启动方式（参考）
 
 ```bash
-./start.sh          # 生产:构建前端 + 后端(:18090) 同端口托管
-./start.sh dev      # 开发:后端(:18090) + Vite(:18089) 并行,热更新
+./start.sh          # 生产:构建前端 + 后端(:18083) 同端口托管
+./start.sh dev      # 开发:后端(:18083) + Vite(:18089) 并行,热更新
 ```
 
 `backend/run.sh` 会 source ROS Foxy + slamware 环境，用系统 `python3.8`（因 rclpy），并 `LD_PRELOAD` libgomp（供相机的 cv2/pyzmq 使用）。
