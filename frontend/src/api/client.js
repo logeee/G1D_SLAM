@@ -21,6 +21,7 @@ async function postJson(url, payload = {}) {
 export const api = {
   getState: () => getJson('/api/state'),
   getPoints: () => getJson('/api/points'),
+  getWorkflows: () => getJson('/api/workflows'),
   getLiftHeight: () => getJson('/api/lift_height'),
   getFaultSnapshots: () => getJson('/api/fault_snapshots'),
   getRelocalizationStatus: () => getJson('/api/relocalization/status'),

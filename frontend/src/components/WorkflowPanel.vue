@@ -5,20 +5,110 @@ import { useTelemetryStore } from '../stores/telemetry.js'
 import { useWorkflowStore } from '../stores/workflow.js'
 import { usePointsStore } from '../stores/points.js'
 import { useColumnHeightStore } from '../stores/columnHeight.js'
+import { useDialogStore } from '../stores/dialog.js'
 import { normalizeAngle, radToDeg, clampSpeedRatio } from '../utils/format.js'
 
 const telemetry = useTelemetryStore()
 const workflow = useWorkflowStore()
 const points = usePointsStore()
 const columnHeight = useColumnHeightStore()
+const dialog = useDialogStore()
 
 const { state } = storeToRefs(telemetry)
-const { workflowRun, editingActionId, navButtonsBusy } = storeToRefs(workflow)
+const { workflowRun, editingActionId, navButtonsBusy, savedChains } = storeToRefs(workflow)
 const { savedPoints } = storeToRefs(points)
 const { statusText: columnStatusText } = storeToRefs(columnHeight)
 
 const running = computed(() => workflowRun.value.running)
 const busy = computed(() => navButtonsBusy.value || running.value)
+
+// ---- action-chain library (save/load/delete/copy to disk) ----
+function chainSelectItems() {
+  return savedChains.value.map(chain => ({
+    value: chain.id,
+    label: `${chain.name}（${chain.count} 个动作）`,
+  }))
+}
+
+// Refresh the library, then let the user pick a saved chain via the modal select.
+// Returns the chosen chain id, or null if none / cancelled.
+async function pickSavedChain(message, title, opts = {}) {
+  await workflow.loadChainLibrary()
+  if (!savedChains.value.length) {
+    await dialog.alert('还没有已保存的动作链，请先“保存当前动作链”。', { title })
+    return null
+  }
+  return dialog.select(message, chainSelectItems(), { title, ...opts })
+}
+
+async function onSaveChain() {
+  if (busy.value) return
+  if (!workflow.workflowActions.length) {
+    workflow.showNavMessage('bad', '动作链：<strong>当前没有动作可保存</strong>')
+    return
+  }
+  const defaultName = `动作链 ${new Date().toLocaleString('zh-CN', { hour12: false })}`
+  const name = await dialog.prompt('给这条动作链起个名字（同名会覆盖）', defaultName, { title: '保存当前动作链' })
+  if (name === null) return
+  const trimmed = String(name).trim()
+  if (!trimmed) {
+    workflow.showNavMessage('bad', '动作链：<strong>名字不能为空</strong>')
+    return
+  }
+  try {
+    const data = await workflow.saveChainToDisk(trimmed)
+    if (data.ok) workflow.showNavMessage('', `动作链：已保存 <strong>${data.chain?.name || trimmed}</strong> 到本地`)
+    else workflow.showNavMessage('bad', `动作链：<strong>保存失败</strong> ${data.error || ''}`)
+  } catch (err) {
+    workflow.showNavMessage('bad', `动作链：<strong>保存请求失败</strong> ${err}`)
+  }
+}
+
+async function onLoadChain() {
+  if (busy.value) return
+  const id = await pickSavedChain('选择要加载的动作链（会替换当前动作）', '加载动作链', { confirmText: '加载' })
+  if (!id) return
+  await workflow.loadChainFromDisk(id)
+}
+
+async function onDeleteChain() {
+  if (busy.value) return
+  const id = await pickSavedChain('选择要删除的动作链', '删除动作链', { confirmText: '下一步', danger: true })
+  if (!id) return
+  const chain = savedChains.value.find(item => item.id === id)
+  const name = chain?.name || '该动作链'
+  const ok = await dialog.confirm(`确定删除“${name}”吗？此操作不可恢复。`, { title: '删除动作链', danger: true, confirmText: '删除' })
+  if (!ok) return
+  try {
+    const data = await workflow.deleteChain(id)
+    if (data.ok) workflow.showNavMessage('', `动作链：已删除 <strong>${name}</strong>`)
+    else workflow.showNavMessage('bad', `动作链：<strong>删除失败</strong> ${data.error || ''}`)
+  } catch (err) {
+    workflow.showNavMessage('bad', `动作链：<strong>删除请求失败</strong> ${err}`)
+  }
+}
+
+async function onCopyChain() {
+  if (busy.value) return
+  const id = await pickSavedChain('选择要复制的动作链', '复制动作链', { confirmText: '下一步' })
+  if (!id) return
+  const chain = savedChains.value.find(item => item.id === id)
+  if (!chain) return
+  const newName = await dialog.prompt('复制为新名称', `${chain.name} 副本`, { title: '复制动作链' })
+  if (newName === null) return
+  const trimmed = String(newName).trim()
+  if (!trimmed) {
+    workflow.showNavMessage('bad', '动作链：<strong>名字不能为空</strong>')
+    return
+  }
+  try {
+    const data = await workflow.copyChain(id, trimmed)
+    if (data.ok) workflow.showNavMessage('', `动作链：已复制为 <strong>${data.chain?.name || trimmed}</strong>`)
+    else workflow.showNavMessage('bad', `动作链：<strong>复制失败</strong> ${data.error || ''}`)
+  } catch (err) {
+    workflow.showNavMessage('bad', `动作链：<strong>复制请求失败</strong> ${err}`)
+  }
+}
 
 // ---- action builder local state ----
 const newActionType = ref('navigate')
@@ -250,6 +340,12 @@ function onDragEnd() {
       <button :disabled="busy" @click="workflow.startNavigation()">仅执行导航</button>
       <button class="danger" @click="workflow.stopNavigation()">停止</button>
       <button :disabled="busy" @click="workflow.clearWorkflowActions()">清空动作</button>
+    </div>
+    <div class="workflow-control-row">
+      <button :disabled="busy" @click="onSaveChain">保存当前动作链</button>
+      <button :disabled="busy" @click="onLoadChain">加载动作链</button>
+      <button class="danger" :disabled="busy" @click="onDeleteChain">删除</button>
+      <button :disabled="busy" @click="onCopyChain">复制</button>
     </div>
     <div class="workflow-actions">
       <div class="action-builder">

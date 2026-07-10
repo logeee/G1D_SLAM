@@ -23,6 +23,7 @@ from .context import ctx
 from .json_response import StrictJSONResponse
 from .api import state as state_api
 from .api import points as points_api
+from .api import workflows as workflows_api
 from .api import navigation as navigation_api
 from .api import actions as actions_api
 from .api import mapping as mapping_api
@@ -122,9 +123,12 @@ def create_app(args) -> FastAPI:
         import rclpy
 
         state, point_store, node = _build_node(args)
+        from .state.workflows import WorkflowChainStore
+
         ctx.state = state
         ctx.node = node
         ctx.point_store = point_store
+        ctx.workflow_store = WorkflowChainStore(args.workflows_file)
 
         from .camera import HeadCameraStreamer
 
@@ -203,6 +207,7 @@ def create_app(args) -> FastAPI:
     for module in (
         state_api,
         points_api,
+        workflows_api,
         navigation_api,
         actions_api,
         mapping_api,
@@ -234,7 +239,10 @@ def create_app(args) -> FastAPI:
 def main() -> int:
     args = parse_args()
     app = create_app(args)
-    uvicorn.run(app, host=args.bind, port=args.port, log_level="info")
+    # timeout_graceful_shutdown caps how long uvicorn waits for in-flight/keep-alive
+    # connections to close on SIGTERM. Browsers poll /api/state every 500ms, so
+    # without this the process lingers until systemd's stop timeout on restart.
+    uvicorn.run(app, host=args.bind, port=args.port, log_level="info", timeout_graceful_shutdown=5)
     return 0
 
 

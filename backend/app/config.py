@@ -73,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw-nav-position-tolerance-m", type=float, default=0.08)
     parser.add_argument("--raw-nav-yaw-tolerance-deg", type=float, default=5.0)
     parser.add_argument("--points-file", default="data/nav_points.json")
+    parser.add_argument("--workflows-file", default="data/workflow_chains.json")
     parser.add_argument("--relocalization-anchor-file", default="data/relocalization_anchor.json")
     parser.add_argument("--last-pose-file", default="data/last_pose.json")
     parser.add_argument("--last-pose-save-interval-sec", type=float, default=10.0)

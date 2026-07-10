@@ -53,6 +53,7 @@ export const useWorkflowStore = defineStore('workflow', () => {
   const points = usePointsStore()
 
   const workflowActions = ref([])
+  const savedChains = ref([])
   const selectedWaypoints = ref([])
   const headingMode = ref(false)
   const finalHeadingPoint = ref(null)
@@ -105,6 +106,78 @@ export const useWorkflowStore = defineStore('workflow', () => {
 
   function clearWorkflowEditMode() {
     editingActionId.value = null
+  }
+
+  // ---- named action-chain library (server-side disk persistence) ----
+  async function loadChainLibrary() {
+    try {
+      const data = await api.getWorkflows()
+      if (data && data.ok) savedChains.value = data.chains || []
+    } catch (err) {
+      console.warn('load workflow library failed', err)
+    }
+    return savedChains.value
+  }
+
+  async function saveChainToDisk(name) {
+    const trimmed = String(name || '').trim()
+    if (!trimmed) return { ok: false, error: '名字不能为空' }
+    if (!workflowActions.value.length) return { ok: false, error: '当前没有动作可保存' }
+    const data = await api.post('/api/workflows/save', { name: trimmed, actions: workflowActions.value })
+    if (data && data.ok) await loadChainLibrary()
+    return data
+  }
+
+  function applyLoadedActions(actions) {
+    workflowActions.value = (Array.isArray(actions) ? actions : [])
+      .filter(action => action && typeof action === 'object')
+      .map(action => ({ ...action, id: action.id || makeActionId(action.type || 'act') }))
+    finalHeadingPoint.value = null
+    manualHeadingDeg.value = null
+    clearWorkflowEditMode()
+    saveWorkflowCache()
+    refreshLinkedWorkflowActions()
+    resetWorkflowRun('已加载动作链')
+  }
+
+  async function loadChainFromDisk(chainId) {
+    if (workflowRun.value.running) {
+      showNavMessage('bad', '动作链执行中：<strong>请先停止后再加载</strong>')
+      return { ok: false, error: 'running' }
+    }
+    let chain = savedChains.value.find(item => item.id === chainId)
+    if (!chain) {
+      await loadChainLibrary()
+      chain = savedChains.value.find(item => item.id === chainId)
+    }
+    if (!chain) {
+      showNavMessage('bad', '动作链：<strong>未找到该动作链，可能已被删除</strong>')
+      return { ok: false, error: 'chain not found' }
+    }
+    applyLoadedActions(chain.actions)
+    showNavMessage('', `动作链：已加载 <strong>${chain.name}</strong>（${chain.count} 个动作）`)
+    return { ok: true, chain }
+  }
+
+  async function deleteChain(chainId) {
+    const data = await api.post('/api/workflows/delete', { id: chainId })
+    if (data && data.ok) await loadChainLibrary()
+    return data
+  }
+
+  async function copyChain(chainId, newName) {
+    const name = String(newName || '').trim()
+    if (!name) return { ok: false, error: '名字不能为空' }
+    let chain = savedChains.value.find(item => item.id === chainId)
+    if (!chain) {
+      await loadChainLibrary()
+      chain = savedChains.value.find(item => item.id === chainId)
+    }
+    if (!chain) return { ok: false, error: 'chain not found' }
+    // Save as a brand-new named chain (no id) so it never overwrites the source.
+    const data = await api.post('/api/workflows/save', { name, actions: chain.actions })
+    if (data && data.ok) await loadChainLibrary()
+    return data
   }
 
   // ---- resolve against saved points ----
@@ -944,6 +1017,7 @@ export const useWorkflowStore = defineStore('workflow', () => {
   return {
     // state
     workflowActions,
+    savedChains,
     selectedWaypoints,
     headingMode,
     finalHeadingPoint,
@@ -969,6 +1043,11 @@ export const useWorkflowStore = defineStore('workflow', () => {
     // mutations
     loadWorkflowCache,
     saveWorkflowCache,
+    loadChainLibrary,
+    saveChainToDisk,
+    loadChainFromDisk,
+    deleteChain,
+    copyChain,
     refreshLinkedWorkflowActions,
     syncSelectedWaypointsFromActions,
     clearWorkflowEditMode,

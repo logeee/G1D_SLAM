@@ -56,6 +56,7 @@ function showMapping() {
 
 onMounted(() => {
   workflow.loadWorkflowCache()
+  workflow.loadChainLibrary()
   loadPoints()
   relocalization.loadStatus()
   columnHeight.refresh({ quiet: true })

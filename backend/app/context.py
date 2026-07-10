@@ -17,6 +17,7 @@ class AppContext:
         self.state = None
         self.node = None
         self.point_store = None
+        self.workflow_store = None
         self.camera = None
 
 
