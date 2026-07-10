@@ -814,102 +814,136 @@ export const useWorkflowStore = defineStore('workflow', () => {
     throw new Error(`等待裸控导航完成超时：status=${statusText}，距离 ${distText}，yaw ${yawText}`)
   }
 
-  async function runWorkflow() {
+  // Execute a single action module (navigation / arm / column / fake). Shared by
+  // one-shot and loop runs. Throws on failure so the caller can stop the run.
+  async function executeWorkflowModule(action, index, label) {
+    if (action.type === 'navigate') {
+      showNavMessage('', `${label}：正在执行第 ${index + 1} 步导航...`)
+      const navData = await startNavigation({
+        fromWorkflow: true,
+        workflowMode: 'chain',
+        waypoints: [{ x: Number(action.x), y: Number(action.y) }],
+        yawDeg: action.yawDeg,
+        yawSource: 'workflow_action',
+        speedRatio: action.speedRatio,
+      })
+      if (!navData.ok) throw new Error(navData.error || '导航启动失败')
+      if (navData.command?.raw_cmd_vel && navData.command?.raw_nav_id) {
+        await waitForRawNavigationComplete(navData.command, action)
+      } else {
+        await waitForSlamwareNavigationComplete(action)
+      }
+      return
+    }
+    if (action.type === 'arm_task') {
+      workflowRun.value.actionStartedAt = Date.now()
+      workflowRun.value.actionDurationSec = action.timeoutSec || 120
+      workflowRun.value = { ...workflowRun.value }
+      showNavMessage('', `${label}：正在执行第 ${index + 1} 步“${action.title || armActionTitle(action)}”...`)
+      const actionData = await api.post('/api/actions/execute', {
+        type: 'arm_task',
+        phase: action.phase,
+        target_object: action.targetObject || '',
+        timeout_sec: workflowRun.value.actionDurationSec,
+        name: action.title || armActionTitle(action),
+      })
+      if (!actionData.ok) {
+        const statusText = actionData.final_status?.status_text || actionData.last_status?.status_text || ''
+        throw new Error(actionData.error || statusText || '机械臂任务执行失败')
+      }
+      return
+    }
+    if (action.type === 'column_height') {
+      workflowRun.value.actionStartedAt = Date.now()
+      workflowRun.value.actionDurationSec = action.timeoutSec || 30
+      workflowRun.value = { ...workflowRun.value }
+      const physicalTarget = action.targetPhysicalHeightM ?? action.target_physical_height_m
+      const rawTarget = action.targetHeightM ?? action.target_height_m
+      const targetText =
+        physicalTarget !== undefined && physicalTarget !== null
+          ? `物理高度=${Number(physicalTarget || 0).toFixed(3)}m`
+          : `raw target=${Number(rawTarget || 0).toFixed(3)}m`
+      showNavMessage('', `${label}：正在执行第 ${index + 1} 步“立柱升降” ${targetText}...`)
+      const payload = { type: 'column_height', timeout_sec: workflowRun.value.actionDurationSec, name: action.title || '立柱升降' }
+      if (physicalTarget !== undefined && physicalTarget !== null) payload.target_physical_height_m = Number(physicalTarget || 0)
+      else payload.target_height_m = Number(rawTarget || 0)
+      const actionData = await api.post('/api/actions/execute', payload)
+      if (!actionData.ok) throw new Error(actionData.error || '立柱升降执行失败')
+      return
+    }
+    if (action.type === 'fake_pick_xiongmao') {
+      workflowRun.value.actionStartedAt = Date.now()
+      workflowRun.value.actionDurationSec = action.durationSec || 5
+      workflowRun.value = { ...workflowRun.value }
+      showNavMessage('', `${label}：正在执行第 ${index + 1} 步“拾取熊猫烟”（${workflowRun.value.actionDurationSec} 秒）...`)
+      const actionData = await api.post('/api/actions/execute', {
+        type: 'fake_pick_xiongmao',
+        name: '拾取熊猫烟',
+        duration_sec: workflowRun.value.actionDurationSec,
+      })
+      if (!actionData.ok) throw new Error(actionData.error || '假动作执行失败')
+      return
+    }
+    throw new Error(`不支持的动作类型：${action.type}`)
+  }
+
+  // Unified sequential engine used by all four run buttons.
+  //   navOnly: only run navigate actions (skip arm/column/fake)
+  //   loop:    repeat the whole chain until stopped
+  async function runWorkflowEngine({ loop = false, navOnly = false } = {}) {
+    const label = navOnly ? '导航' : '动作链'
     const modules = getWorkflowModules()
-    if (!modules.length) {
-      showNavMessage('bad', '动作链：<strong>请先增加至少一个动作</strong>')
+    const runnable = navOnly ? modules.filter(m => m.type === 'navigate') : modules
+    if (!runnable.length) {
+      showNavMessage('bad', navOnly ? '导航：<strong>请先增加至少一个导航动作</strong>' : '动作链：<strong>请先增加至少一个动作</strong>')
       return
     }
     beginWorkflowRun('chain', 0)
+    workflowRun.value = { ...workflowRun.value, loop, navOnly, loopCount: 0, note: loop ? `${label}循环执行中` : `${label}执行中` }
     try {
-      for (let index = 0; index < modules.length; index++) {
-        const action = modules[index]
-        const run = { ...workflowRun.value }
-        run.currentIndex = index
-        run.actionStartedAt = 0
-        workflowRun.value = run
-        if (action.type === 'navigate') {
-          showNavMessage('', `动作链：正在执行第 ${index + 1} 步导航...`)
-          const navData = await startNavigation({
-            fromWorkflow: true,
-            workflowMode: 'chain',
-            waypoints: [{ x: Number(action.x), y: Number(action.y) }],
-            yawDeg: action.yawDeg,
-            yawSource: 'workflow_action',
-            speedRatio: action.speedRatio,
-          })
-          if (!navData.ok) throw new Error(navData.error || '导航启动失败')
-          if (navData.command?.raw_cmd_vel && navData.command?.raw_nav_id) {
-            await waitForRawNavigationComplete(navData.command, action)
-          } else {
-            await waitForSlamwareNavigationComplete(action)
-          }
-          workflowRun.value.completed[action.id] = true
-          continue
+      let pass = 0
+      do {
+        pass += 1
+        if (pass > 1) {
+          // Fresh pass: clear the per-module completion badges so progress restarts.
+          workflowRun.value = { ...workflowRun.value, completed: {}, currentIndex: 0, loopCount: pass - 1 }
         }
-        if (action.type === 'arm_task') {
-          workflowRun.value.actionStartedAt = Date.now()
-          workflowRun.value.actionDurationSec = action.timeoutSec || 120
-          workflowRun.value = { ...workflowRun.value }
-          showNavMessage('', `动作链：正在执行第 ${index + 1} 步“${action.title || armActionTitle(action)}”...`)
-          const actionData = await api.post('/api/actions/execute', {
-            type: 'arm_task',
-            phase: action.phase,
-            target_object: action.targetObject || '',
-            timeout_sec: workflowRun.value.actionDurationSec,
-            name: action.title || armActionTitle(action),
-          })
-          if (!actionData.ok) {
-            const statusText = actionData.final_status?.status_text || actionData.last_status?.status_text || ''
-            throw new Error(actionData.error || statusText || '机械臂任务执行失败')
-          }
+        for (let index = 0; index < modules.length; index++) {
+          const action = modules[index]
+          if (navOnly && action.type !== 'navigate') continue
+          workflowRun.value = { ...workflowRun.value, currentIndex: index, actionStartedAt: 0 }
+          const loopText = loop ? `（第 ${pass} 轮）` : ''
+          await executeWorkflowModule(action, index, `${label}${loopText}`)
           workflowRun.value.completed[action.id] = true
-          continue
         }
-        if (action.type === 'column_height') {
-          workflowRun.value.actionStartedAt = Date.now()
-          workflowRun.value.actionDurationSec = action.timeoutSec || 30
-          workflowRun.value = { ...workflowRun.value }
-          const physicalTarget = action.targetPhysicalHeightM ?? action.target_physical_height_m
-          const rawTarget = action.targetHeightM ?? action.target_height_m
-          const targetText =
-            physicalTarget !== undefined && physicalTarget !== null
-              ? `物理高度=${Number(physicalTarget || 0).toFixed(3)}m`
-              : `raw target=${Number(rawTarget || 0).toFixed(3)}m`
-          showNavMessage('', `动作链：正在执行第 ${index + 1} 步“立柱升降” ${targetText}...`)
-          const payload = { type: 'column_height', timeout_sec: workflowRun.value.actionDurationSec, name: action.title || '立柱升降' }
-          if (physicalTarget !== undefined && physicalTarget !== null) payload.target_physical_height_m = Number(physicalTarget || 0)
-          else payload.target_height_m = Number(rawTarget || 0)
-          const actionData = await api.post('/api/actions/execute', payload)
-          if (!actionData.ok) throw new Error(actionData.error || '立柱升降执行失败')
-          workflowRun.value.completed[action.id] = true
-          continue
-        }
-        if (action.type === 'fake_pick_xiongmao') {
-          workflowRun.value.actionStartedAt = Date.now()
-          workflowRun.value.actionDurationSec = action.durationSec || 5
-          workflowRun.value = { ...workflowRun.value }
-          showNavMessage('', `动作链：正在执行第 ${index + 1} 步“拾取熊猫烟”（${workflowRun.value.actionDurationSec} 秒）...`)
-          const actionData = await api.post('/api/actions/execute', {
-            type: 'fake_pick_xiongmao',
-            name: '拾取熊猫烟',
-            duration_sec: workflowRun.value.actionDurationSec,
-          })
-          if (!actionData.ok) throw new Error(actionData.error || '假动作执行失败')
-          workflowRun.value.completed[action.id] = true
-          continue
-        }
-        throw new Error(`不支持的动作类型：${action.type}`)
-      }
+      } while (loop && workflowRun.value.running)
       const run = { ...workflowRun.value }
       run.running = false
-      run.note = '动作链完成'
+      run.note = `${label}完成`
       workflowRun.value = run
-      showNavMessage('', '动作链：<strong>已完成</strong>')
+      showNavMessage('', `${label}：<strong>已完成</strong>`)
     } catch (err) {
-      markWorkflowError(String(err.message || err))
-      showNavMessage('bad', `动作链：<strong>执行失败</strong> ${err.message || err}`)
+      const message = String(err.message || err)
+      if (message.includes('已停止') || !workflowRun.value.running) {
+        // Clean stop triggered by the 停止 button — not an execution failure.
+        workflowRun.value = { ...workflowRun.value, running: false, note: '已停止' }
+      } else {
+        markWorkflowError(message)
+        showNavMessage('bad', `${label}：<strong>执行失败</strong> ${message}`)
+      }
     }
+  }
+
+  function runWorkflow() {
+    return runWorkflowEngine({ loop: false, navOnly: false })
+  }
+
+  function runWorkflowLoop() {
+    return runWorkflowEngine({ loop: true, navOnly: false })
+  }
+
+  function runNavigationLoop() {
+    return runWorkflowEngine({ loop: true, navOnly: true })
   }
 
   async function stopNavigation() {
@@ -1074,6 +1108,8 @@ export const useWorkflowStore = defineStore('workflow', () => {
     // run
     startNavigation,
     runWorkflow,
+    runWorkflowLoop,
+    runNavigationLoop,
     stopNavigation,
     // heading & map
     setHeadingMode,

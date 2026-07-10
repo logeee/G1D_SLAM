@@ -341,6 +341,8 @@ function onDragEnd() {
     <div class="workflow-control-row">
       <button class="primary" :disabled="busy" @click="workflow.runWorkflow()">执行动作链</button>
       <button :disabled="busy" @click="workflow.startNavigation()">仅执行导航</button>
+      <button :disabled="busy" @click="workflow.runWorkflowLoop()">循环执行动作链</button>
+      <button :disabled="busy" @click="workflow.runNavigationLoop()">循环仅执行导航</button>
       <button class="danger" @click="workflow.stopNavigation()">停止</button>
       <button :disabled="busy" @click="workflow.clearWorkflowActions()">清空动作</button>
     </div>
