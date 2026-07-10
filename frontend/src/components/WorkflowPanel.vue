@@ -38,7 +38,10 @@ async function pickSavedChain(message, title, opts = {}) {
     await dialog.alert('还没有已保存的动作链，请先“保存当前动作链”。', { title })
     return null
   }
-  return dialog.select(message, chainSelectItems(), { title, ...opts })
+  // Default the dropdown to the currently loaded chain (if it still exists).
+  const current = workflow.currentChainId
+  const defaultValue = current && savedChains.value.some(chain => chain.id === current) ? current : undefined
+  return dialog.select(message, chainSelectItems(), { title, defaultValue, ...opts })
 }
 
 async function onSaveChain() {

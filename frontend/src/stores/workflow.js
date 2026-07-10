@@ -54,6 +54,7 @@ export const useWorkflowStore = defineStore('workflow', () => {
 
   const workflowActions = ref([])
   const savedChains = ref([])
+  const currentChainId = ref('')
   const selectedWaypoints = ref([])
   const headingMode = ref(false)
   const finalHeadingPoint = ref(null)
@@ -124,7 +125,11 @@ export const useWorkflowStore = defineStore('workflow', () => {
     if (!trimmed) return { ok: false, error: '名字不能为空' }
     if (!workflowActions.value.length) return { ok: false, error: '当前没有动作可保存' }
     const data = await api.post('/api/workflows/save', { name: trimmed, actions: workflowActions.value })
-    if (data && data.ok) await loadChainLibrary()
+    if (data && data.ok) {
+      // The current actions now correspond to this saved chain.
+      if (data.chain?.id) currentChainId.value = data.chain.id
+      await loadChainLibrary()
+    }
     return data
   }
 
@@ -155,13 +160,17 @@ export const useWorkflowStore = defineStore('workflow', () => {
       return { ok: false, error: 'chain not found' }
     }
     applyLoadedActions(chain.actions)
+    currentChainId.value = chain.id
     showNavMessage('', `动作链：已加载 <strong>${chain.name}</strong>（${chain.count} 个动作）`)
     return { ok: true, chain }
   }
 
   async function deleteChain(chainId) {
     const data = await api.post('/api/workflows/delete', { id: chainId })
-    if (data && data.ok) await loadChainLibrary()
+    if (data && data.ok) {
+      if (currentChainId.value === chainId) currentChainId.value = ''
+      await loadChainLibrary()
+    }
     return data
   }
 
@@ -521,6 +530,7 @@ export const useWorkflowStore = defineStore('workflow', () => {
     finalHeadingPoint.value = null
     manualHeadingDeg.value = null
     draggedActionId.value = null
+    currentChainId.value = ''
     clearWorkflowEditMode()
     saveWorkflowCache()
     setHeadingMode(false)
@@ -1018,6 +1028,7 @@ export const useWorkflowStore = defineStore('workflow', () => {
     // state
     workflowActions,
     savedChains,
+    currentChainId,
     selectedWaypoints,
     headingMode,
     finalHeadingPoint,
