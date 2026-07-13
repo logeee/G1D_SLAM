@@ -38,6 +38,7 @@ DEFAULT_AUTO_CALIBRATE_WARMUP_SEC = 2.0
 DEFAULT_AUTO_CALIBRATE_STABLE_THRESHOLD_M = 0.002
 DEFAULT_AUTO_CALIBRATE_STABLE_COUNT = 3
 DEFAULT_AUTO_CALIBRATE_POLL_INTERVAL_SEC = 0.1
+DEFAULT_AUTO_CALIBRATE_MIN_JUMP_RESET_M = 0.05
 
 
 def finite_or_none(value: Any, ndigits: Optional[int] = None) -> Optional[float]:
@@ -251,10 +252,12 @@ class LiftHeightService:
         threshold = max(0.0001, float(self.args.auto_calibrate_stable_threshold_m))
         required_count = max(1, int(self.args.auto_calibrate_stable_count))
         poll_interval = max(0.02, float(self.args.auto_calibrate_poll_interval_sec))
+        min_jump_reset = max(threshold * 2.0, float(self.args.auto_calibrate_min_jump_reset_m))
 
-        start = time.time()
+        start = time.monotonic()
         min_seen: Optional[float] = None
         stable_count = 0
+        above_min_count = 0
         sample_count = 0
         latest_updated_at = 0.0
         self._set_auto_state(
@@ -267,9 +270,9 @@ class LiftHeightService:
             sample_count=0,
         )
 
-        while time.time() - start < timeout:
+        while time.monotonic() - start < timeout:
             raw_y_m, updated_at = self.latest_raw()
-            elapsed = time.time() - start
+            elapsed = time.monotonic() - start
             if raw_y_m is None:
                 self._set_auto_state(
                     state="detecting_min",
@@ -284,6 +287,15 @@ class LiftHeightService:
 
             sample_count += 1
             latest_updated_at = max(latest_updated_at, updated_at)
+            if min_seen is not None and raw_y_m > min_seen + min_jump_reset:
+                above_min_count += 1
+                if above_min_count >= required_count:
+                    min_seen = raw_y_m
+                    stable_count = 0
+                    above_min_count = 0
+            else:
+                above_min_count = 0
+
             if min_seen is None or raw_y_m < min_seen:
                 min_seen = raw_y_m
                 stable_count = 0
@@ -300,9 +312,11 @@ class LiftHeightService:
                 current_y_m=finite_or_none(raw_y_m, 6),
                 min_seen_y_m=finite_or_none(min_seen, 6),
                 stable_count=stable_count,
+                above_min_count=above_min_count,
                 sample_count=sample_count,
                 stable_threshold_m=threshold,
                 stable_count_required=required_count,
+                min_jump_reset_m=min_jump_reset,
             )
 
             if elapsed >= warmup and min_seen is not None and stable_count >= required_count:
@@ -517,6 +531,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto-calibrate-stable-threshold-m", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_STABLE_THRESHOLD_M", DEFAULT_AUTO_CALIBRATE_STABLE_THRESHOLD_M)))
     parser.add_argument("--auto-calibrate-stable-count", type=int, default=int(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_STABLE_COUNT", DEFAULT_AUTO_CALIBRATE_STABLE_COUNT)))
     parser.add_argument("--auto-calibrate-poll-interval-sec", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_POLL_INTERVAL_SEC", DEFAULT_AUTO_CALIBRATE_POLL_INTERVAL_SEC)))
+    parser.add_argument("--auto-calibrate-min-jump-reset-m", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_MIN_JUMP_RESET_M", DEFAULT_AUTO_CALIBRATE_MIN_JUMP_RESET_M)))
     parser.add_argument("--wait-sec", type=float, default=float(os.environ.get("G1D_LIFT_WAIT_SEC", 1.0)))
     parser.add_argument("--quiet", action="store_true", default=os.environ.get("G1D_LIFT_QUIET", "1").lower() in ("1", "true", "yes"))
     return parser
