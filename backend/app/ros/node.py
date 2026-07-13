@@ -80,6 +80,8 @@ class BaseSensorNode(Node):
         arm_command_topic: str,
         arm_status_topic: str,
         arm_task_timeout_sec: float,
+        arm_command_ack_retry_count: int,
+        arm_command_ack_retry_interval_sec: float,
         arm_stop_phases: Iterable[str],
         column_control_bin: str,
         column_control_workdir: str,
@@ -142,6 +144,8 @@ class BaseSensorNode(Node):
         self.arm_command_topic = arm_command_topic
         self.arm_status_topic = arm_status_topic
         self.arm_task_timeout_sec = max(1.0, float(arm_task_timeout_sec))
+        self.arm_command_ack_retry_count = max(0, min(10, int(arm_command_ack_retry_count)))
+        self.arm_command_ack_retry_interval_sec = max(0.2, min(5.0, float(arm_command_ack_retry_interval_sec)))
         self.arm_stop_phases = [str(phase).strip().upper() for phase in arm_stop_phases if str(phase).strip()]
         if not self.arm_stop_phases:
             self.arm_stop_phases = ["RESET"]
@@ -1220,22 +1224,44 @@ class BaseSensorNode(Node):
         msg.data = json.dumps(command, ensure_ascii=False)
         with self.arm_status_condition:
             self.arm_status_by_task_id.pop(task_id, None)
+        wait_subscriber_deadline = time.time() + min(2.0, self.arm_command_ack_retry_interval_sec)
+        while self.arm_task_command_pub.get_subscription_count() <= 0 and time.time() < wait_subscriber_deadline:
+            time.sleep(0.05)
         self.arm_task_command_pub.publish(msg)
+        publish_attempts = 1
+        last_publish_at = time.time()
 
         deadline = time.time() + timeout
         final_status: Optional[Dict[str, Any]] = None
         terminal_codes = {2, 3, 4}
         terminal_texts = {"DONE", "FAILED", "REJECTED"}
+        busy_grace_deadline = 0.0
         while time.time() < deadline:
             remaining = max(0.0, deadline - time.time())
             with self.arm_status_condition:
                 self.arm_status_condition.wait(timeout=min(0.5, remaining))
                 history = list(self.arm_status_by_task_id.get(task_id, []))
+            if (
+                not history
+                and publish_attempts <= self.arm_command_ack_retry_count
+                and time.time() - last_publish_at >= self.arm_command_ack_retry_interval_sec
+            ):
+                self.arm_task_command_pub.publish(msg)
+                publish_attempts += 1
+                last_publish_at = time.time()
+                continue
             if history:
                 latest = history[-1]
                 status_code = latest.get("exec_status")
                 status_text = str(latest.get("status_text") or "").upper()
                 if status_code in terminal_codes or status_text in terminal_texts:
+                    parsed = latest.get("parsed") if isinstance(latest.get("parsed"), dict) else {}
+                    error_code = str(parsed.get("error_code") or "").upper()
+                    if status_text == "REJECTED" and error_code == "BUSY" and publish_attempts > 1:
+                        if busy_grace_deadline <= 0:
+                            busy_grace_deadline = min(deadline, time.time() + 5.0)
+                        if time.time() < busy_grace_deadline:
+                            continue
                     final_status = latest
                     break
 
@@ -1252,6 +1278,7 @@ class BaseSensorNode(Node):
                 "command": command,
                 "status_history": status_history,
                 "last_status": status_history[-1] if status_history else None,
+                "publish_attempts": publish_attempts,
                 "timeout_sec": timeout,
                 "started_at": started_at,
                 "finished_at": now_iso(),
@@ -1270,6 +1297,7 @@ class BaseSensorNode(Node):
             "command": command,
             "final_status": final_status,
             "status_history": status_history,
+            "publish_attempts": publish_attempts,
             "timeout_sec": timeout,
             "started_at": started_at,
             "finished_at": now_iso(),

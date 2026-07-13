@@ -83,6 +83,8 @@ def _build_node(args):
         arm_command_topic=args.arm_command_topic,
         arm_status_topic=args.arm_status_topic,
         arm_task_timeout_sec=args.arm_task_timeout_sec,
+        arm_command_ack_retry_count=args.arm_command_ack_retry_count,
+        arm_command_ack_retry_interval_sec=args.arm_command_ack_retry_interval_sec,
         arm_stop_phases=args.arm_stop_phases.split(","),
         column_control_bin=args.column_control_bin,
         column_control_workdir=args.column_control_workdir,

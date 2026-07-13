@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arm-command-topic", default="/arm_control/task_command")
     parser.add_argument("--arm-status-topic", default="/arm_control/task_status")
     parser.add_argument("--arm-task-timeout-sec", type=float, default=120.0)
+    parser.add_argument("--arm-command-ack-retry-count", type=int, default=4)
+    parser.add_argument("--arm-command-ack-retry-interval-sec", type=float, default=1.0)
     parser.add_argument(
         "--arm-stop-phases",
         default="RESET,SUCTION_STOP,MOTION_STOP",
