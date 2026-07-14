@@ -1,0 +1,14 @@
+# FastAPI backend runtime deps, pinned for the system Python 3.8 that ships the
+# ROS Foxy rclpy C-extension. Install with:
+#   /usr/bin/python3 -m pip install --user -r backend/requirements.txt
+#
+# NOTE: rclpy + the slamware_ros_sdk / geometry_msgs / nav_msgs / sensor_msgs
+# message packages come from the sourced ROS 2 Foxy overlay, NOT from pip.
+#
+# Version ceilings matter on Python 3.8:
+#   - pydantic >= 2.10 dropped 3.8
+#   - uvicorn  >= 0.34 dropped 3.8
+#   - fastapi  0.115.x is the last line supporting 3.8
+fastapi==0.115.12
+uvicorn==0.33.0
+pydantic==2.9.2

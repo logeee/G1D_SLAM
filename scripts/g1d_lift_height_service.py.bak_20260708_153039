@@ -32,13 +32,12 @@ DEFAULT_SDK_MAX_M = 0.2469
 DEFAULT_FULL_TRAVEL_M = 0.427
 DEFAULT_CALIBRATION_PATH = "/home/unitree/.config/g1d_lift_height/calibration.json"
 DEFAULT_AUTO_CALIBRATE_ON_BOOT = True
+DEFAULT_AUTO_CALIBRATE_DELAY_SEC = 75.0
 DEFAULT_AUTO_CALIBRATE_MAX_UPTIME_SEC = 300.0
-DEFAULT_AUTO_CALIBRATE_TIMEOUT_SEC = 90.0
-DEFAULT_AUTO_CALIBRATE_WARMUP_SEC = 2.0
-DEFAULT_AUTO_CALIBRATE_STABLE_THRESHOLD_M = 0.002
-DEFAULT_AUTO_CALIBRATE_STABLE_COUNT = 3
-DEFAULT_AUTO_CALIBRATE_POLL_INTERVAL_SEC = 0.1
-DEFAULT_AUTO_CALIBRATE_MIN_JUMP_RESET_M = 0.05
+DEFAULT_AUTO_CALIBRATE_SAMPLE_SEC = 3.0
+DEFAULT_AUTO_CALIBRATE_STABLE_TOLERANCE_M = 0.003
+DEFAULT_AUTO_CALIBRATE_RETRIES = 5
+DEFAULT_AUTO_CALIBRATE_RETRY_INTERVAL_SEC = 5.0
 
 
 def finite_or_none(value: Any, ndigits: Optional[int] = None) -> Optional[float]:
@@ -91,6 +90,14 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
 class DdsHispeedReader:
     def __init__(self, *, network_interface: str, hispeed_topic: str, sdk2py_path: str) -> None:
         if sdk2py_path and Path(sdk2py_path).exists() and sdk2py_path not in sys.path:
@@ -139,9 +146,6 @@ class LiftHeightService:
             "enabled": bool(args.auto_calibrate_on_boot),
             "state": "disabled" if not args.auto_calibrate_on_boot else "starting",
             "message": "",
-            "stable_threshold_m": args.auto_calibrate_stable_threshold_m,
-            "stable_count_required": args.auto_calibrate_stable_count,
-            "boot_uptime_sec": uptime_sec(),
             "updated_at": now_iso(),
         }
         self.calibration_path = Path(args.calibration_path).expanduser()
@@ -230,6 +234,34 @@ class LiftHeightService:
             }
         return self.save_min(raw_y_m, source="manual_min_calibration", note=note, updated_at=updated_at)
 
+    def sample_stable_raw(self, *, sample_sec: float, tolerance_m: float) -> dict[str, Any]:
+        deadline = time.time() + max(0.2, sample_sec)
+        samples: list[float] = []
+        latest_updated_at = 0.0
+        while time.time() < deadline:
+            raw_y_m, updated_at = self.latest_raw()
+            if raw_y_m is not None:
+                samples.append(raw_y_m)
+                latest_updated_at = max(latest_updated_at, updated_at)
+            time.sleep(0.05)
+        if not samples:
+            return {"ok": False, "error": self.reader_error or "no hispeed frame", "samples": 0}
+        raw_min = min(samples)
+        raw_max = max(samples)
+        spread = raw_max - raw_min
+        stable = spread <= tolerance_m
+        return {
+            "ok": stable,
+            "stable": stable,
+            "raw_y_m": median(samples),
+            "raw_min_m": raw_min,
+            "raw_max_m": raw_max,
+            "spread_m": spread,
+            "samples": len(samples),
+            "updated_at": latest_updated_at,
+            "tolerance_m": tolerance_m,
+        }
+
     def _auto_calibrate_on_boot(self) -> None:
         saved = load_json(self.calibration_path)
         current_boot_id = boot_id()
@@ -247,117 +279,31 @@ class LiftHeightService:
             )
             return
 
-        timeout = max(2.0, float(self.args.auto_calibrate_timeout_sec))
-        warmup = max(0.0, float(self.args.auto_calibrate_warmup_sec))
-        threshold = max(0.0001, float(self.args.auto_calibrate_stable_threshold_m))
-        required_count = max(1, int(self.args.auto_calibrate_stable_count))
-        poll_interval = max(0.02, float(self.args.auto_calibrate_poll_interval_sec))
-        min_jump_reset = max(threshold * 2.0, float(self.args.auto_calibrate_min_jump_reset_m))
+        delay = max(0.0, float(self.args.auto_calibrate_delay_sec))
+        self._set_auto_state(state="waiting_for_boot_zero", message=f"waiting {delay:.1f}s for column to auto-lower")
+        time.sleep(delay)
 
-        start = time.monotonic()
-        min_seen: Optional[float] = None
-        stable_count = 0
-        above_min_count = 0
-        sample_count = 0
-        latest_updated_at = 0.0
-        self._set_auto_state(
-            state="detecting_min",
-            message="tracking hispeed_y minimum until it is stable",
-            timeout_sec=timeout,
-            warmup_sec=warmup,
-            min_seen_y_m=None,
-            stable_count=0,
-            sample_count=0,
-        )
-
-        while time.monotonic() - start < timeout:
-            raw_y_m, updated_at = self.latest_raw()
-            elapsed = time.monotonic() - start
-            if raw_y_m is None:
-                self._set_auto_state(
-                    state="detecting_min",
-                    message=self.reader_error or "waiting for hispeed frame",
-                    elapsed_sec=round(elapsed, 3),
-                    min_seen_y_m=finite_or_none(min_seen, 6),
-                    stable_count=stable_count,
-                    sample_count=sample_count,
-                )
-                time.sleep(poll_interval)
-                continue
-
-            sample_count += 1
-            latest_updated_at = max(latest_updated_at, updated_at)
-            if min_seen is not None and raw_y_m > min_seen + min_jump_reset:
-                above_min_count += 1
-                if above_min_count >= required_count:
-                    min_seen = raw_y_m
-                    stable_count = 0
-                    above_min_count = 0
-            else:
-                above_min_count = 0
-
-            if min_seen is None or raw_y_m < min_seen:
-                min_seen = raw_y_m
-                stable_count = 0
-
-            if min_seen is not None and abs(raw_y_m - min_seen) <= threshold:
-                stable_count += 1
-            else:
-                stable_count = 0
-
-            self._set_auto_state(
-                state="detecting_min",
-                message="tracking hispeed_y minimum until it is stable",
-                elapsed_sec=round(elapsed, 3),
-                current_y_m=finite_or_none(raw_y_m, 6),
-                min_seen_y_m=finite_or_none(min_seen, 6),
-                stable_count=stable_count,
-                above_min_count=above_min_count,
-                sample_count=sample_count,
-                stable_threshold_m=threshold,
-                stable_count_required=required_count,
-                min_jump_reset_m=min_jump_reset,
-            )
-
-            if elapsed >= warmup and min_seen is not None and stable_count >= required_count:
+        retries = max(1, int(self.args.auto_calibrate_retries))
+        sample_sec = max(0.2, float(self.args.auto_calibrate_sample_sec))
+        tolerance = max(0.0001, float(self.args.auto_calibrate_stable_tolerance_m))
+        for attempt in range(1, retries + 1):
+            self._set_auto_state(state="sampling", message=f"sampling hispeed_y for boot zero attempt {attempt}/{retries}", attempt=attempt)
+            sample = self.sample_stable_raw(sample_sec=sample_sec, tolerance_m=tolerance)
+            self._set_auto_state(state="sampled", message="sampled boot zero", attempt=attempt, sample=sample)
+            if sample.get("ok"):
                 result = self.save_min(
-                    min_seen,
+                    float(sample["raw_y_m"]),
                     source="auto_boot_min_calibration",
-                    note="auto detected minimum hispeed_y after boot column auto-lower",
-                    updated_at=latest_updated_at,
-                    extra={
-                        "auto_detection": {
-                            "elapsed_sec": round(elapsed, 3),
-                            "stable_threshold_m": threshold,
-                            "stable_count_required": required_count,
-                            "stable_count": stable_count,
-                            "sample_count": sample_count,
-                            "warmup_sec": warmup,
-                            "timeout_sec": timeout,
-                        }
-                    },
+                    note="auto calibrated after boot column auto-lower",
+                    updated_at=float(sample.get("updated_at") or 0.0),
+                    extra={"auto_sample": sample},
                 )
-                self._set_auto_state(
-                    state="done",
-                    message="auto boot minimum detection done",
-                    result=result,
-                    min_seen_y_m=finite_or_none(min_seen, 6),
-                    stable_count=stable_count,
-                    sample_count=sample_count,
-                    elapsed_sec=round(elapsed, 3),
-                )
+                self._set_auto_state(state="done", message="auto boot calibration done", attempt=attempt, result=result, sample=sample)
                 return
+            if attempt < retries:
+                time.sleep(max(0.2, float(self.args.auto_calibrate_retry_interval_sec)))
 
-            time.sleep(poll_interval)
-
-        self._set_auto_state(
-            state="failed",
-            message="auto boot minimum detection timed out before minimum became stable",
-            min_seen_y_m=finite_or_none(min_seen, 6),
-            stable_count=stable_count,
-            sample_count=sample_count,
-            timeout_sec=timeout,
-        )
+        self._set_auto_state(state="failed", message="auto boot calibration failed: raw height was not stable", sample=sample)
 
     def reset_calibration(self) -> dict[str, Any]:
         try:
@@ -399,8 +345,6 @@ class LiftHeightService:
         else:
             error = None
         ok = physical_height is not None and error is None
-        auto_state = self._auto_state()
-        detecting = bool(auto_state.get("state") in ("starting", "detecting_min"))
         return {
             "ok": ok,
             "service": "g1d_lift_height_service",
@@ -410,12 +354,6 @@ class LiftHeightService:
             "raw_height_m": finite_or_none(raw_y_m, 6),
             "lift_offset_m": finite_or_none(lift_offset, 6),
             "physical_height_m": finite_or_none(physical_height, 6),
-            "offset": finite_or_none(lift_offset, 6) if offset_valid else None,
-            "column_height": finite_or_none(raw_y_m, 6),
-            "physical_height": finite_or_none(physical_height, 6) if physical_height is not None else -1.0,
-            "detecting": detecting,
-            "min_seen_y_m": finite_or_none(auto_state.get("min_seen_y_m"), 6),
-            "stable_count": int(auto_state.get("stable_count") or 0),
             "full_travel_m": finite_or_none(full_travel, 6),
             "sdk_min_m": finite_or_none(sdk_min, 6),
             "sdk_max_m": finite_or_none(sdk_max, 6),
@@ -424,7 +362,7 @@ class LiftHeightService:
             "offset_valid": offset_valid,
             "calibration_source": calibration_source,
             "calibration_path": str(self.calibration_path),
-            "auto_calibration": auto_state,
+            "auto_calibration": self._auto_state(),
             "boot_id": boot_id(),
             "uptime_sec": finite_or_none(uptime_sec(), 3),
             "data_age_sec": finite_or_none(data_age, 3),
@@ -525,13 +463,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-arg-default", action="store_true", default=os.environ.get("G1D_LIFT_ALLOW_ARG_DEFAULT", "0").lower() in ("1", "true", "yes"))
     parser.add_argument("--auto-calibrate-on-boot", dest="auto_calibrate_on_boot", action="store_true", default=os.environ.get("G1D_LIFT_AUTO_CALIBRATE_ON_BOOT", str(int(DEFAULT_AUTO_CALIBRATE_ON_BOOT))).lower() in ("1", "true", "yes"))
     parser.add_argument("--no-auto-calibrate-on-boot", dest="auto_calibrate_on_boot", action="store_false")
+    parser.add_argument("--auto-calibrate-delay-sec", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_DELAY_SEC", DEFAULT_AUTO_CALIBRATE_DELAY_SEC)))
     parser.add_argument("--auto-calibrate-max-uptime-sec", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_MAX_UPTIME_SEC", DEFAULT_AUTO_CALIBRATE_MAX_UPTIME_SEC)))
-    parser.add_argument("--auto-calibrate-timeout-sec", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_TIMEOUT_SEC", DEFAULT_AUTO_CALIBRATE_TIMEOUT_SEC)))
-    parser.add_argument("--auto-calibrate-warmup-sec", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_WARMUP_SEC", DEFAULT_AUTO_CALIBRATE_WARMUP_SEC)))
-    parser.add_argument("--auto-calibrate-stable-threshold-m", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_STABLE_THRESHOLD_M", DEFAULT_AUTO_CALIBRATE_STABLE_THRESHOLD_M)))
-    parser.add_argument("--auto-calibrate-stable-count", type=int, default=int(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_STABLE_COUNT", DEFAULT_AUTO_CALIBRATE_STABLE_COUNT)))
-    parser.add_argument("--auto-calibrate-poll-interval-sec", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_POLL_INTERVAL_SEC", DEFAULT_AUTO_CALIBRATE_POLL_INTERVAL_SEC)))
-    parser.add_argument("--auto-calibrate-min-jump-reset-m", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_MIN_JUMP_RESET_M", DEFAULT_AUTO_CALIBRATE_MIN_JUMP_RESET_M)))
+    parser.add_argument("--auto-calibrate-sample-sec", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_SAMPLE_SEC", DEFAULT_AUTO_CALIBRATE_SAMPLE_SEC)))
+    parser.add_argument("--auto-calibrate-stable-tolerance-m", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_STABLE_TOLERANCE_M", DEFAULT_AUTO_CALIBRATE_STABLE_TOLERANCE_M)))
+    parser.add_argument("--auto-calibrate-retries", type=int, default=int(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_RETRIES", DEFAULT_AUTO_CALIBRATE_RETRIES)))
+    parser.add_argument("--auto-calibrate-retry-interval-sec", type=float, default=float(os.environ.get("G1D_LIFT_AUTO_CALIBRATE_RETRY_INTERVAL_SEC", DEFAULT_AUTO_CALIBRATE_RETRY_INTERVAL_SEC)))
     parser.add_argument("--wait-sec", type=float, default=float(os.environ.get("G1D_LIFT_WAIT_SEC", 1.0)))
     parser.add_argument("--quiet", action="store_true", default=os.environ.get("G1D_LIFT_QUIET", "1").lower() in ("1", "true", "yes"))
     return parser
