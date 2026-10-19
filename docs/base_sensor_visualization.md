@@ -236,7 +236,7 @@ curl -s -X POST http://127.0.0.1:18083/api/points/delete \
 
 - 点击 `增加动作` 可以把动作加入链表；动作类型当前有 `导航`、`机械臂抓取`、`机械臂放置`、`机械臂复位`、`立柱升降`。
 - `导航` 动作可以直接选择点位库里的点位，自动填入 `x/y/yaw_deg`；也可以手动填写，或直接在地图上点击快速增加导航动作。
-- `机械臂抓取` 会选择目标标签并发布 ROS JSON 到 `/arm_control/task_command`，目前目标标签为 `XiongMao` 和 `Xizi_Liqun`。
+- `机械臂抓取` 会通过 18081 的 `/config/yolo_model` 和 `/config/object_sizes` 读取当前模型全部类别及烟名，再把选中的模型标签发布到 `/arm_control/task_command`。更换 18081 模型后点击“刷新目标”即可更新；已保存但新模型不再包含的旧标签仍会保留显示，避免动作链被静默改写。
 - `机械臂放置` / `机械臂复位` 会发布 `PLACE` / `RESET`，`target_object` 留空。
 - `立柱升降` 是原始动作，默认调用 `/home/unitree/unitree_sdk2/build/bin/g1d_height_control eth0 <目标高度m>`。
 - 动作卡片可以拖拽排序，也可以单独删除。

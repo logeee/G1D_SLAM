@@ -42,6 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arm-command-ack-retry-count", type=int, default=4)
     parser.add_argument("--arm-command-ack-retry-interval-sec", type=float, default=1.0)
     parser.add_argument(
+        "--yolo-config-base-url",
+        default="http://127.0.0.1:18081",
+        help="YOLO service used to populate mechanical-arm pickup targets.",
+    )
+    parser.add_argument("--yolo-config-timeout-sec", type=float, default=3.0)
+    parser.add_argument(
         "--arm-stop-phases",
         default="RESET,SUCTION_STOP,MOTION_STOP",
         help="Comma-separated arm phases published by the Stop button.",

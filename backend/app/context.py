@@ -19,6 +19,7 @@ class AppContext:
         self.point_store = None
         self.workflow_store = None
         self.camera = None
+        self.arm_targets = None
 
 
 ctx = AppContext()

@@ -32,6 +32,7 @@ from .api import reloc2d as reloc2d_api
 from .api import faults as faults_api
 from .api import control as control_api
 from .api import camera as camera_api
+from .api import arm_targets as arm_targets_api
 
 
 _DEV_PLACEHOLDER_HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -132,6 +133,13 @@ def create_app(args) -> FastAPI:
         ctx.point_store = point_store
         ctx.workflow_store = WorkflowChainStore(args.workflows_file)
 
+        from .arm_targets import ArmTargetCatalog
+
+        ctx.arm_targets = ArmTargetCatalog(
+            args.yolo_config_base_url,
+            timeout_sec=args.yolo_config_timeout_sec,
+        )
+
         from .camera import HeadCameraStreamer
 
         ctx.camera = HeadCameraStreamer(
@@ -218,6 +226,7 @@ def create_app(args) -> FastAPI:
         faults_api,
         control_api,
         camera_api,
+        arm_targets_api,
     ):
         app.include_router(module.router)
 

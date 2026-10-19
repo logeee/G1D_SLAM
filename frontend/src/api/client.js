@@ -23,6 +23,7 @@ export const api = {
   getPoints: () => getJson('/api/points'),
   getWorkflows: () => getJson('/api/workflows'),
   getLiftHeight: () => getJson('/api/lift_height'),
+  getArmTargets: () => getJson('/api/arm_targets'),
   getFaultSnapshots: () => getJson('/api/fault_snapshots'),
   getRelocalizationStatus: () => getJson('/api/relocalization/status'),
   getMappingStatus: () => getJson('/api/mapping/status'),

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useTelemetryStore } from '../stores/telemetry.js'
 import { useWorkflowStore } from '../stores/workflow.js'
@@ -7,6 +7,7 @@ import { usePointsStore } from '../stores/points.js'
 import { useColumnHeightStore } from '../stores/columnHeight.js'
 import { useDialogStore } from '../stores/dialog.js'
 import { normalizeAngle, radToDeg, clampSpeedRatio } from '../utils/format.js'
+import { api } from '../api/client.js'
 
 const telemetry = useTelemetryStore()
 const workflow = useWorkflowStore()
@@ -120,8 +121,12 @@ const newActionX = ref('')
 const newActionY = ref('')
 const newActionYawDeg = ref('')
 const newActionSpeedRatio = ref(1)
-const newArmTargetObject = ref('XiongMao')
+const newArmTargetObject = ref('')
 const newArmTimeoutSec = ref(120)
+const armTargets = ref([])
+const armTargetModel = ref('')
+const armTargetsLoading = ref(false)
+const armTargetError = ref('')
 const newColumnTargetHeightM = ref(0)
 const newColumnTimeoutSec = ref(30)
 
@@ -129,6 +134,51 @@ const isNav = computed(() => newActionType.value === 'navigate')
 const isArm = computed(() => newActionType.value.startsWith('arm_'))
 const isArmPick = computed(() => newActionType.value === 'arm_pick')
 const isColumn = computed(() => newActionType.value === 'column_height')
+
+const armTargetOptions = computed(() => {
+  const options = armTargets.value.map(target => ({
+    value: String(target.target_object || target.label || ''),
+    label: String(target.display_name || target.name || target.label || target.target_object || ''),
+    stale: false,
+  })).filter(option => option.value)
+  const selected = String(newArmTargetObject.value || '')
+  if (selected && !options.some(option => option.value === selected)) {
+    options.unshift({ value: selected, label: `已保存目标（当前模型未包含）：${selected}`, stale: true })
+  }
+  return options
+})
+
+const armTargetStatusText = computed(() => {
+  if (armTargetsLoading.value) return '正在读取 18081 当前模型…'
+  if (armTargetError.value) return `读取失败：${armTargetError.value}`
+  const model = armTargetModel.value ? `模型 ${armTargetModel.value}` : '当前模型'
+  return `${model} · ${armTargets.value.length} 个抓取目标`
+})
+
+async function refreshArmTargets({ quiet = false } = {}) {
+  if (armTargetsLoading.value) return
+  armTargetsLoading.value = true
+  if (!quiet) armTargetError.value = ''
+  try {
+    const data = await api.getArmTargets()
+    if (!data?.ok) throw new Error(data?.error || '18081 未返回可用类别')
+    armTargets.value = Array.isArray(data.targets) ? data.targets : []
+    armTargetModel.value = String(data.model || '')
+    armTargetError.value = Array.isArray(data.warnings) && data.warnings.length ? data.warnings.join('；') : ''
+    if (!newArmTargetObject.value && armTargets.value.length) {
+      newArmTargetObject.value = String(armTargets.value[0].target_object || armTargets.value[0].label || '')
+    }
+  } catch (err) {
+    armTargetError.value = String(err?.message || err)
+  } finally {
+    armTargetsLoading.value = false
+  }
+}
+
+onMounted(() => refreshArmTargets({ quiet: true }))
+watch(isArmPick, value => {
+  if (value && !armTargets.value.length) refreshArmTargets({ quiet: true })
+})
 
 const addBtnLabel = computed(() => (editingActionId.value ? '保存动作' : '增加动作'))
 
@@ -297,7 +347,7 @@ function editAction(actionId) {
     newActionYawDeg.value = resolved.yawDeg !== undefined ? Number(resolved.yawDeg).toFixed(1) : ''
     newActionSpeedRatio.value = Number(clampSpeedRatio(resolved.speedRatio, 1).toFixed(2))
   } else if (type.startsWith('arm_')) {
-    newArmTargetObject.value = resolved.targetObject || resolved.target_object || 'XiongMao'
+    newArmTargetObject.value = resolved.targetObject || resolved.target_object || armTargets.value[0]?.target_object || ''
     newArmTimeoutSec.value = Number(resolved.timeoutSec || 120)
   } else if (type === 'column_height') {
     const physicalTarget = resolved.targetPhysicalHeightM ?? resolved.target_physical_height_m ?? resolved.targetHeightM ?? 0
@@ -384,14 +434,19 @@ function onDragEnd() {
           <input v-model.number="newActionSpeedRatio" type="number" step="0.05" min="0.05" max="1" :disabled="busy" />
         </label>
         <label v-show="isArm" class="arm-action-field">抓取目标
-          <select v-model="newArmTargetObject" :disabled="busy || !isArmPick">
-            <option value="XiongMao">XiongMao / 熊猫烟</option>
-            <option value="Xizi_Liqun">Xizi_Liqun / 西子利群</option>
+          <select v-model="newArmTargetObject" :disabled="busy || !isArmPick || armTargetsLoading || !armTargetOptions.length">
+            <option v-for="target in armTargetOptions" :key="target.value" :value="target.value">
+              {{ target.label }}
+            </option>
           </select>
         </label>
         <label v-show="isArm" class="arm-action-field">超时 s
           <input v-model.number="newArmTimeoutSec" type="number" step="1" min="1" max="600" :disabled="busy" />
         </label>
+        <div v-show="isArm && isArmPick" class="arm-target-status">
+          <span :class="{ bad: armTargetError }">{{ armTargetStatusText }}</span>
+          <button type="button" :disabled="busy || armTargetsLoading" @click="refreshArmTargets()">刷新目标</button>
+        </div>
         <label v-show="isColumn" class="column-action-field">目标物理高度 m
           <input v-model.number="newColumnTargetHeightM" type="number" step="0.001" min="0" max="0.427" :disabled="busy" />
         </label>

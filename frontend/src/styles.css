@@ -163,6 +163,9 @@ section {
 .column-height-status { grid-column: 1 / -1; border: 1px solid #bfdbfe; border-radius: 8px; background: #eff6ff; color: #1e3a8a; padding: 8px 10px; font-size: 12px; line-height: 1.45; }
 .column-height-buttons { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
 .column-height-buttons button { min-height: 34px; }
+.arm-target-status { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+.arm-target-status .bad { color: #b91c1c; }
+.arm-target-status button { min-height: 32px; white-space: nowrap; }
 .action-builder-actions {
   display: flex;
   flex-wrap: wrap;
